@@ -507,6 +507,14 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
 
   // automatically detect sensor type
   this->sensor = dlio::SensorType::UNKNOWN;
+  
+  // Guard: cloud may be empty after NaN removal / cropping
+  if (original_scan_->points.empty()) {
+    this->scan_header_stamp = pc->header.stamp;
+    this->original_scan = original_scan_;
+    return;
+  }
+
   for (auto &field : pc->fields) {
     if (field.name == "t") {
       this->sensor = dlio::SensorType::OUSTER;
@@ -592,7 +600,11 @@ void dlio::OdomNode::preprocessPoints() {
 }
 
 void dlio::OdomNode::deskewPointcloud() {
-
+  if (!this->original_scan || this->original_scan->points.empty()) {
+    this->deskewed_scan.reset(new pcl::PointCloud<PointType>());
+    this->deskew_status = false;
+    return;
+  }
   pcl::PointCloud<PointType>::Ptr deskewed_scan_ = std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan->points.size());
   // deskewed_scan_->points.resize(this->original_scan->points.size());
   // individual point timestamps should be relative to this time
