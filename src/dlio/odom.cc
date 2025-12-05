@@ -799,8 +799,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Compute Metrics
-  this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
-  this->metrics_thread.detach();
+  this->computeMetrics();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
@@ -853,16 +852,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   } else {
     published_cloud = this->deskewed_scan;
   }
-  this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
-  this->publish_thread.detach();
+  this->publishToROS(published_cloud, this->T_corr);
 
   // Update some statistics
   this->comp_times.push_back(this->now().seconds() - then);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
   // Debug statements and publish custom DLIO message
-  this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
-  this->debug_thread.detach();
+  this->debug();
 
   this->geo.first_opt_done = true;
 
@@ -1797,8 +1794,7 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
     this->keyframes[i].second = transformed_keyframe;
     this->keyframe_normals[i] = transformed_covariances;
 
-    this->publish_keyframe_thread = std::thread( &dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i] );
-    this->publish_keyframe_thread.detach();
+    this->publishKeyframe(this->keyframes[i], this->keyframe_timestamps[i]);
   }
 
   lock.unlock();

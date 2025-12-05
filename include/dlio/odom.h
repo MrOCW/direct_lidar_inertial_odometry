@@ -142,12 +142,6 @@ private:
   std::atomic<bool> deskew_status;
   std::atomic<int> deskew_size;
 
-  // Threads
-  std::thread publish_thread;
-  std::thread publish_keyframe_thread;
-  std::thread metrics_thread;
-  std::thread debug_thread;
-
   // Trajectory
   std::vector<std::pair<Eigen::Vector3f, Eigen::Quaternionf>> trajectory;
   double length_traversed;
