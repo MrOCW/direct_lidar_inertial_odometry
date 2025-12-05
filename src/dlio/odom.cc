@@ -977,7 +977,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
       }
 
       this->imu_calibrated = true;
-
+      this->prev_imu_stamp = imu_stamp_secs;
     }
 
   } else {
