@@ -15,6 +15,7 @@ project(direct_lidar_inertial_odometry)
 find_package(rosidl_default_generators REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -22,7 +23,7 @@ find_package(nav_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 
 find_package(PCL REQUIRED)
-find_package( Eigen3 REQUIRED )
+find_package(Eigen3 REQUIRED )
 find_package(Threads REQUIRED)
 
 set(CMAKE_BUILD_TYPE "Release")
@@ -63,8 +64,36 @@ add_library(nano_gicp STATIC
 target_link_libraries(nano_gicp ${PCL_LIBRARIES} ${OpenMP_LIBS} nanoflann)
 ament_target_dependencies(nano_gicp)
 
+# ===================================================================
+# Composable odometry component (dlio::OdomNode)
+# ===================================================================
+add_library(dlio_odom_component SHARED
+  src/dlio/odom.cpp
+)
+
+target_link_libraries(dlio_odom_component
+  ${PCL_LIBRARIES}
+  ${OpenMP_LIBS}
+  Threads::Threads
+  nano_gicp
+)
+
+ament_target_dependencies(dlio_odom_component
+  rclcpp
+  rclcpp_components
+  tf2_ros
+  pcl_ros
+  nav_msgs
+  pcl_conversions
+  sensor_msgs
+  geometry_msgs
+)
+
+# Register the component (matches RCLCPP_COMPONENTS_REGISTER_NODE in odom.cpp)
+rclcpp_components_register_nodes(dlio_odom_component "dlio::OdomNode")
+
 # Odometry Node
-add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
+add_executable(dlio_odom_node src/dlio/odom_node.cpp src/dlio/odom.cpp)
 target_link_libraries(dlio_odom_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp)
 ament_target_dependencies(dlio_odom_node "tf2_ros" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs")
 
@@ -75,13 +104,22 @@ ament_target_dependencies(dlio_map_node "tf2_ros" "pcl_ros" "pcl_conversions" "r
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp std_msgs sensor_msgs geometry_msgs pcl_ros)
+ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs pcl_ros)
 ament_package()
 
 # Binaries
 install( TARGETS dlio_odom_node dlio_map_node
          DESTINATION lib/${PROJECT_NAME} 
 )
+
+install(
+  TARGETS
+    dlio_odom_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
 install( DIRECTORY cfg launch
          DESTINATION share/${PROJECT_NAME} 
 )
@@ -105,5 +143,5 @@ if(HAS_CPUID)
 endif()
 
 target_compile_options(dlio_odom_node PRIVATE ${OpenMP_FLAGS})
-
 target_compile_options(dlio_map_node PRIVATE ${OpenMP_FLAGS})
+target_compile_options(dlio_odom_component PRIVATE ${OpenMP_FLAGS})

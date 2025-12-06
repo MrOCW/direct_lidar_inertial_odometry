@@ -1,14 +1,5 @@
-/***********************************************************
- *                                                         *
- * Copyright (c)                                           *
- *                                                         *
- * The Verifiable & Control-Theoretic Robotics (VECTR) Lab *
- * University of California, Los Angeles                   *
- *                                                         *
- * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
- * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
- *                                                         *
- ***********************************************************/
+#ifndef DLIO_ODOM_HPP_ 
+#define DLIO_ODOM_HPP_ 
 
 #include "dlio/dlio.h"
 
@@ -38,11 +29,13 @@
 #include <pcl/surface/convex_hull.h>
 #include <pcl_conversions/pcl_conversions.h>
 
-class dlio::OdomNode: public rclcpp::Node {
+namespace dlio
+{
 
+class OdomNode : public rclcpp::Node
+{
 public:
-
-  OdomNode();
+  explicit OdomNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
   ~OdomNode();
 
   void start();
@@ -358,3 +351,7 @@ private:
   double geo_gbias_max_;
 
 };
+
+} // namespace dlio
+
+#endif // DLIO_ODOM_HPP_ 

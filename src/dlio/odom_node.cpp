@@ -10,7 +10,7 @@
  *                                                         *
  ***********************************************************/
 
-#include "dlio/odom.h"
+#include "dlio/odom.hpp"
 
 int main(int argc, char** argv) {
   mallopt(M_ARENA_MAX, 1);
