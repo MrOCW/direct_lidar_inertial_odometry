@@ -9,33 +9,61 @@ DLIO is a new lightweight LiDAR-inertial odometry algorithm with a novel coarse-
     <img src="./doc/img/dlio.png" alt="drawing" width="720"/>
 </p>
 
-## Main changes from the original repo
-- Bugfixes
-- Support Ubuntu 24.04, ROS2 Jazzy (note in Setup section)
-- Remove detached threads causing crashes and publish messages synchronously
-- Odometry node now supports ComposableNode
+## Changes in this fork
 
-## Setup
-This fork was only tested with the following:
-- Jetson Xavier NX
-    - Jetpack 5
-    - ROS2 Jazzy docker image
-- Mid-360 Lidar
+- Fixes for crashes caused by detached worker threads
+- Synchronous ROS message publication
+- A composable `dlio::OdomNode`
+- Livox MID-360 configuration
+- ROS 2 Jazzy support on the `jazzy` branch
+- ROS 2 Lyrical support on the `lyrical` branch
 
-```sh
-sudo apt install libomp-dev libpcl-dev libeigen3-dev ros-jazzy-pcl-ros
+## Supported setup
+
+This fork has been tested with:
+
+- NVIDIA Jetson Xavier NX
+- Livox MID-360 LiDAR and IMU
+- ROS2 Lyrical Docker image
+
+## Build for ROS 2 Lyrical
+
+Select the Lyrical branch and install dependencies with rosdep:
+
+```bash
+git switch lyrical
+source /opt/ros/lyrical/setup.bash
+rosdep install --from-paths . --ignore-src -r -y --rosdistro lyrical
 ```
 
-After compilation, execute via
-```sh
+From the ROS workspace root, build the package:
+
+```bash
+colcon build --packages-select direct_lidar_inertial_odometry \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+```
+
+## Launch
+
+Run the composable odometry node with the MID-360 topics:
+
+```bash
 ros2 launch direct_lidar_inertial_odometry dlio_composable.launch.py \
-  rviz:={true, false} \
-  pointcloud_topic:=/lidar \
-  imu_topic:=/imu
-  
-ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
-  rviz:={true, false} \
-  pointcloud_topic:=/lidar \
-  imu_topic:=/imu
+  rviz:=true \
+  pointcloud_topic:=/livox/lidar \
+  imu_topic:=/livox/imu
 ```
 
+Or run the standalone odometry and mapping nodes:
+
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+  rviz:=true \
+  pointcloud_topic:=/livox/lidar \
+  imu_topic:=/livox/imu
+```
+
+Set `rviz:=false` for headless operation. Odometry is published on
+`/dlio/odom_node/odom`, with the trajectory on `/dlio/odom_node/path` and the
+deskewed cloud on `/dlio/odom_node/pointcloud/deskewed`.

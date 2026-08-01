@@ -21,6 +21,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED )
@@ -53,16 +55,16 @@ include_directories(SYSTEM)
 add_library(nanoflann STATIC
   src/nano_gicp/nanoflann.cc
 )
+set_target_properties(nanoflann PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(nanoflann ${PCL_LIBRARIES})
-ament_target_dependencies(nanoflann)
 
 # NanoGICP
 add_library(nano_gicp STATIC
   src/nano_gicp/lsq_registration.cc
   src/nano_gicp/nano_gicp.cc
 )
+set_target_properties(nano_gicp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(nano_gicp ${PCL_LIBRARIES} ${OpenMP_LIBS} nanoflann)
-ament_target_dependencies(nano_gicp)
 
 # ===================================================================
 # Composable odometry component (dlio::OdomNode)
@@ -76,17 +78,13 @@ target_link_libraries(dlio_odom_component
   ${OpenMP_LIBS}
   Threads::Threads
   nano_gicp
-)
-
-ament_target_dependencies(dlio_odom_component
-  rclcpp
-  rclcpp_components
-  tf2_ros
-  pcl_ros
-  nav_msgs
-  pcl_conversions
-  sensor_msgs
-  geometry_msgs
+  rclcpp::rclcpp
+  rclcpp_components::component
+  tf2_ros::tf2_ros
+  pcl_conversions::pcl_conversions
+  nav_msgs::nav_msgs__rosidl_typesupport_cpp
+  sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
+  geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
 )
 
 # Register the component (matches RCLCPP_COMPONENTS_REGISTER_NODE in odom.cpp)
@@ -94,13 +92,29 @@ rclcpp_components_register_nodes(dlio_odom_component "dlio::OdomNode")
 
 # Odometry Node
 add_executable(dlio_odom_node src/dlio/odom_node.cpp src/dlio/odom.cpp)
-target_link_libraries(dlio_odom_node ${PCL_LIBRARIES} ${OpenMP_LIBS} Threads::Threads nano_gicp)
-ament_target_dependencies(dlio_odom_node "tf2_ros" "pcl_ros" "nav_msgs" "pcl_conversions" "rclcpp" "sensor_msgs" "geometry_msgs")
+target_link_libraries(dlio_odom_node
+  ${PCL_LIBRARIES}
+  ${OpenMP_LIBS}
+  Threads::Threads
+  nano_gicp
+  rclcpp::rclcpp
+  rclcpp_components::component
+  tf2_ros::tf2_ros
+  pcl_conversions::pcl_conversions
+  nav_msgs::nav_msgs__rosidl_typesupport_cpp
+  sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
+  geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
+)
 
 # Mapping Node
 add_executable (dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
-target_link_libraries(dlio_map_node ${PCL_LIBRARIES}  ${cpp_typesupport_target})
-ament_target_dependencies(dlio_map_node "tf2_ros" "pcl_ros" "pcl_conversions" "rclcpp")
+target_link_libraries(dlio_map_node
+  ${PCL_LIBRARIES}
+  ${cpp_typesupport_target}
+  rclcpp::rclcpp
+  pcl_conversions::pcl_conversions
+  sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
+)
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
