@@ -191,6 +191,9 @@ void OdomNode::getParams() {
   declare_param(this, "frames/lidar", this->lidar_frame, "lidar");
   declare_param(this, "frames/imu", this->imu_frame, "imu");
 
+  // TF publication
+  declare_param(this, "publish/odom_tf", this->publish_odom_tf_, true);
+
   // Deskew Flag
   declare_param(this, "pointcloud/deskew", this->deskew_, true);
 
@@ -387,20 +390,22 @@ void OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud
   // transform: odom to baselink
   geometry_msgs::msg::TransformStamped transformStamped;
 
-  transformStamped.header.stamp = this->imu_stamp;
-  transformStamped.header.frame_id = this->odom_frame;
-  transformStamped.child_frame_id = this->baselink_frame;
+  if (this->publish_odom_tf_) {
+    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.frame_id = this->odom_frame;
+    transformStamped.child_frame_id = this->baselink_frame;
 
-  transformStamped.transform.translation.x = this->state.p[0];
-  transformStamped.transform.translation.y = this->state.p[1];
-  transformStamped.transform.translation.z = this->state.p[2];
+    transformStamped.transform.translation.x = this->state.p[0];
+    transformStamped.transform.translation.y = this->state.p[1];
+    transformStamped.transform.translation.z = this->state.p[2];
 
-  transformStamped.transform.rotation.w = this->state.q.w();
-  transformStamped.transform.rotation.x = this->state.q.x();
-  transformStamped.transform.rotation.y = this->state.q.y();
-  transformStamped.transform.rotation.z = this->state.q.z();
+    transformStamped.transform.rotation.w = this->state.q.w();
+    transformStamped.transform.rotation.x = this->state.q.x();
+    transformStamped.transform.rotation.y = this->state.q.y();
+    transformStamped.transform.rotation.z = this->state.q.z();
 
-  br->sendTransform(transformStamped);
+    br->sendTransform(transformStamped);
+  }
 
   // transform: baselink to imu
   transformStamped.header.stamp = this->imu_stamp;

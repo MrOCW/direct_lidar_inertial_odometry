@@ -17,6 +17,8 @@
 
     adaptive: true
 
+    publish/odom_tf: false
+
     pointcloud/deskew: true
     pointcloud/voxelize: true
 

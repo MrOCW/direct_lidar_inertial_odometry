@@ -118,6 +118,7 @@ private:
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+  bool publish_odom_tf_;
 
   // ROS Msgs
   nav_msgs::msg::Odometry odom_ros;

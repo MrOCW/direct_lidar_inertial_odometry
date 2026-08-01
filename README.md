@@ -67,3 +67,8 @@ ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
 Set `rviz:=false` for headless operation. Odometry is published on
 `/dlio/odom_node/odom`, with the trajectory on `/dlio/odom_node/path` and the
 deskewed cloud on `/dlio/odom_node/pointcloud/deskewed`.
+
+## TF ownership
+
+`publish/odom_tf` controls whether the odometry node broadcasts the dynamic
+`odom -> base_link` transform.
