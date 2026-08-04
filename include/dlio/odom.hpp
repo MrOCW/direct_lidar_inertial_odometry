@@ -299,6 +299,8 @@ private:
   std::string version_;
   int num_threads_;
 
+  bool debug_enabled_;
+
   bool deskew_;
 
   double gravity_;

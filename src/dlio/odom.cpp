@@ -194,6 +194,9 @@ void OdomNode::getParams() {
   // TF publication
   declare_param(this, "publish/odom_tf", this->publish_odom_tf_, true);
 
+  // Terminal debug dashboard
+  declare_param(this, "debug/enable", this->debug_enabled_, false);
+
   // Deskew Flag
   declare_param(this, "pointcloud/deskew", this->deskew_, true);
 
@@ -866,8 +869,11 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
   this->comp_times.push_back(this->now().seconds() - then);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
-  // Debug statements and publish custom DLIO message
-  this->debug();
+  // Read this parameter on each scan so the dashboard can be toggled at runtime.
+  this->get_parameter("debug/enable", this->debug_enabled_);
+  if (this->debug_enabled_) {
+    this->debug();
+  }
 
   this->geo.first_opt_done = true;
 
