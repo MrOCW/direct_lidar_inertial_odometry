@@ -18,10 +18,16 @@
     adaptive: true
 
     publish/odom_tf: false
+    publish/sensor_tf: false
     debug/enable: false
 
     pointcloud/deskew: true
     pointcloud/voxelize: true
+    pointcloud/qos/reliability: best_effort
+    pointcloud/qos/depth: 2
+
+    imu/qos/reliability: best_effort
+    imu/qos/depth: 50
 
     imu/calibration: true
     imu/intrinsics/accel/bias: [ 0.0, 0.0, 0.0 ]
@@ -30,11 +36,11 @@
                                  0.,  0.,  1. ]
     imu/intrinsics/gyro/bias: [ 0.0, 0.0, 0.0 ]
 
-    extrinsics/baselink2imu/t: [ -0.0415, 0.02323, 0.11038 ] 
+    extrinsics/baselink2imu/t: [ -0.038, 0.02329, 0.11939 ]
     extrinsics/baselink2imu/R: [ 1.,  0.,  0.,
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]
-    extrinsics/baselink2lidar/t: [ -0.0525,  0.,  0.1545 ]
+    extrinsics/baselink2lidar/t: [ -0.049,  0.,  0.16351 ]
     extrinsics/baselink2lidar/R: [ 1.,  0.,  0.,
                                    0.,  1.,  0.,
                                    0.,  0.,  1. ]

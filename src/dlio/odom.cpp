@@ -14,10 +14,33 @@
 #include "dlio/utils.h"
 
 #include <queue>
+#include <stdexcept>
 
 #include "rclcpp/qos.hpp"
 namespace dlio
 {
+
+namespace
+{
+rclcpp::QoS makeSensorQos(int depth, const std::string & reliability)
+{
+  if (depth <= 0) {
+    throw std::invalid_argument("Sensor QoS depth must be greater than zero");
+  }
+
+  rclcpp::QoS qos{rclcpp::KeepLast(static_cast<size_t>(depth))};
+  qos.durability_volatile();
+  if (reliability == "best_effort") {
+    qos.best_effort();
+  } else if (reliability == "reliable") {
+    qos.reliable();
+  } else {
+    throw std::invalid_argument(
+      "Sensor QoS reliability must be 'best_effort' or 'reliable', got '" + reliability + "'");
+  }
+  return qos;
+}
+}  // namespace
   
 OdomNode::OdomNode(const rclcpp::NodeOptions & options)
 : rclcpp::Node("dlio_odom_node", options) {
@@ -37,13 +60,16 @@ OdomNode::OdomNode(const rclcpp::NodeOptions & options)
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
-  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", 1,
+  const auto pointcloud_qos = makeSensorQos(
+    this->pointcloud_qos_depth_, this->pointcloud_qos_reliability_);
+  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", pointcloud_qos,
       std::bind(&OdomNode::callbackPointCloud, this, std::placeholders::_1), lidar_sub_opt);
 
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto imu_sub_opt = rclcpp::SubscriptionOptions();
   imu_sub_opt.callback_group = this->imu_cb_group;
-  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::SensorDataQoS(),
+  const auto imu_qos = makeSensorQos(this->imu_qos_depth_, this->imu_qos_reliability_);
+  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu", imu_qos,
       std::bind(&OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
 
   this->odom_pub     = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
@@ -193,9 +219,18 @@ void OdomNode::getParams() {
 
   // TF publication
   declare_param(this, "publish/odom_tf", this->publish_odom_tf_, true);
+  declare_param(this, "publish/sensor_tf", this->publish_sensor_tf_, true);
 
   // Terminal debug dashboard
   declare_param(this, "debug/enable", this->debug_enabled_, false);
+
+  // Keep middleware queues bounded so stale sensor data is never replayed in a burst.
+  declare_param(this, "pointcloud/qos/reliability", this->pointcloud_qos_reliability_,
+    std::string("best_effort"));
+  declare_param(this, "pointcloud/qos/depth", this->pointcloud_qos_depth_, 2);
+  declare_param(this, "imu/qos/reliability", this->imu_qos_reliability_,
+    std::string("best_effort"));
+  declare_param(this, "imu/qos/depth", this->imu_qos_depth_, 50);
 
   // Deskew Flag
   declare_param(this, "pointcloud/deskew", this->deskew_, true);
@@ -410,39 +445,41 @@ void OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud
     br->sendTransform(transformStamped);
   }
 
-  // transform: baselink to imu
-  transformStamped.header.stamp = this->imu_stamp;
-  transformStamped.header.frame_id = this->baselink_frame;
-  transformStamped.child_frame_id = this->imu_frame;
+  if (this->publish_sensor_tf_) {
+    // transform: baselink to imu
+    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.frame_id = this->baselink_frame;
+    transformStamped.child_frame_id = this->imu_frame;
 
-  transformStamped.transform.translation.x = this->extrinsics.baselink2imu.t[0];
-  transformStamped.transform.translation.y = this->extrinsics.baselink2imu.t[1];
-  transformStamped.transform.translation.z = this->extrinsics.baselink2imu.t[2];
+    transformStamped.transform.translation.x = this->extrinsics.baselink2imu.t[0];
+    transformStamped.transform.translation.y = this->extrinsics.baselink2imu.t[1];
+    transformStamped.transform.translation.z = this->extrinsics.baselink2imu.t[2];
 
-  Eigen::Quaternionf q(this->extrinsics.baselink2imu.R);
-  transformStamped.transform.rotation.w = q.w();
-  transformStamped.transform.rotation.x = q.x();
-  transformStamped.transform.rotation.y = q.y();
-  transformStamped.transform.rotation.z = q.z();
+    Eigen::Quaternionf q(this->extrinsics.baselink2imu.R);
+    transformStamped.transform.rotation.w = q.w();
+    transformStamped.transform.rotation.x = q.x();
+    transformStamped.transform.rotation.y = q.y();
+    transformStamped.transform.rotation.z = q.z();
 
-  br->sendTransform(transformStamped);
+    br->sendTransform(transformStamped);
 
-  // transform: baselink to lidar
-  transformStamped.header.stamp = this->imu_stamp;
-  transformStamped.header.frame_id = this->baselink_frame;
-  transformStamped.child_frame_id = this->lidar_frame;
+    // transform: baselink to lidar
+    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.frame_id = this->baselink_frame;
+    transformStamped.child_frame_id = this->lidar_frame;
 
-  transformStamped.transform.translation.x = this->extrinsics.baselink2lidar.t[0];
-  transformStamped.transform.translation.y = this->extrinsics.baselink2lidar.t[1];
-  transformStamped.transform.translation.z = this->extrinsics.baselink2lidar.t[2];
+    transformStamped.transform.translation.x = this->extrinsics.baselink2lidar.t[0];
+    transformStamped.transform.translation.y = this->extrinsics.baselink2lidar.t[1];
+    transformStamped.transform.translation.z = this->extrinsics.baselink2lidar.t[2];
 
-  Eigen::Quaternionf qq(this->extrinsics.baselink2lidar.R);
-  transformStamped.transform.rotation.w = qq.w();
-  transformStamped.transform.rotation.x = qq.x();
-  transformStamped.transform.rotation.y = qq.y();
-  transformStamped.transform.rotation.z = qq.z();
+    Eigen::Quaternionf qq(this->extrinsics.baselink2lidar.R);
+    transformStamped.transform.rotation.w = qq.w();
+    transformStamped.transform.rotation.x = qq.x();
+    transformStamped.transform.rotation.y = qq.y();
+    transformStamped.transform.rotation.z = qq.z();
 
-  br->sendTransform(transformStamped);
+    br->sendTransform(transformStamped);
+  }
 
 }
 

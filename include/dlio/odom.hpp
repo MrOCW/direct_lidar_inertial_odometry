@@ -119,6 +119,7 @@ private:
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
   bool publish_odom_tf_;
+  bool publish_sensor_tf_;
 
   // ROS Msgs
   nav_msgs::msg::Odometry odom_ros;
@@ -300,6 +301,11 @@ private:
   int num_threads_;
 
   bool debug_enabled_;
+
+  std::string pointcloud_qos_reliability_;
+  int pointcloud_qos_depth_;
+  std::string imu_qos_reliability_;
+  int imu_qos_depth_;
 
   bool deskew_;
 

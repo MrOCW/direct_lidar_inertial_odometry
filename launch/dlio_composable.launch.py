@@ -14,6 +14,10 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz', default='true')
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/livox/lidar')
     imu_topic = LaunchConfiguration('imu_topic', default='/livox/imu')
+    lidar_qos_reliability = LaunchConfiguration('lidar_qos_reliability')
+    lidar_qos_depth = LaunchConfiguration('lidar_qos_depth')
+    imu_qos_reliability = LaunchConfiguration('imu_qos_reliability')
+    imu_qos_depth = LaunchConfiguration('imu_qos_depth')
 
     # Declare launch arguments
     declare_rviz_arg = DeclareLaunchArgument(
@@ -31,6 +35,18 @@ def generate_launch_description():
         default_value=imu_topic,
         description='IMU topic name'
     )
+    declare_lidar_qos_reliability_arg = DeclareLaunchArgument(
+        'lidar_qos_reliability', default_value='best_effort'
+    )
+    declare_lidar_qos_depth_arg = DeclareLaunchArgument(
+        'lidar_qos_depth', default_value='2'
+    )
+    declare_imu_qos_reliability_arg = DeclareLaunchArgument(
+        'imu_qos_reliability', default_value='best_effort'
+    )
+    declare_imu_qos_depth_arg = DeclareLaunchArgument(
+        'imu_qos_depth', default_value='50'
+    )
 
     # Parameter files
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
@@ -42,7 +58,16 @@ def generate_launch_description():
         plugin='dlio::OdomNode',
         name='dlio_odom_node',
         # namespace='dlio',
-        parameters=[dlio_yaml_path, dlio_params_yaml_path],
+        parameters=[
+            dlio_yaml_path,
+            dlio_params_yaml_path,
+            {
+                'pointcloud/qos/reliability': lidar_qos_reliability,
+                'pointcloud/qos/depth': lidar_qos_depth,
+                'imu/qos/reliability': imu_qos_reliability,
+                'imu/qos/depth': imu_qos_depth,
+            },
+        ],
         remappings=[
             # Inputs
             ('pointcloud', pointcloud_topic),
@@ -83,6 +108,10 @@ def generate_launch_description():
         declare_rviz_arg,
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
+        declare_lidar_qos_reliability_arg,
+        declare_lidar_qos_depth_arg,
+        declare_imu_qos_reliability_arg,
+        declare_imu_qos_depth_arg,
         dlio_container,
         rviz_node,
     ])
