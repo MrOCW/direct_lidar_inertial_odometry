@@ -36,6 +36,48 @@
                                  0.,  0.,  1. ]
     imu/intrinsics/gyro/bias: [ 0.0, 0.0, 0.0 ]
 
+    odom/imu/maxGap: 0.05
+    odom/imu/waitTimeout: 0.05
+    odom/imu/calibration/minSamples: 400
+    odom/imu/calibration/gyroStddevMax: 0.01
+    odom/imu/calibration/gyroMeanMax: 0.05
+    odom/imu/calibration/accelNormStddevMax: 0.08
+    odom/imu/calibration/accelGravityTolerance: 0.5
+    odom/imu/onlineGyroBias/enabled: true
+    odom/imu/onlineGyroBias/stationaryTime: 2.0
+    odom/imu/onlineGyroBias/lidarLinearMax: 0.02
+    odom/imu/onlineGyroBias/lidarAngularMax: 0.5
+    odom/imu/onlineGyroBias/timeConstant: 30.0
+    odom/imu/onlineGyroBias/maxDelta: 0.05
+
+    odom/gicp/maxCorrectionDistance: 1.0
+    odom/gicp/maxCorrectionRotation: 45.0
+    odom/gicp/minCorrespondenceRatio: 0.20
+    odom/gicp/qualityHistorySize: 50
+    odom/gicp/qualityWarmupScans: 20
+    odom/gicp/maxNormalizedErrorFactor: 3.0
+    odom/gicp/maxHessianCondition: 100000000.0
+    odom/gicp/maxHessianConditionFactor: 10.0
+    odom/gicp/softCorrectionDistance: 0.06
+    odom/gicp/softCorrectionRotation: 1.0
+    odom/gicp/correctionConfirmationScans: 2
+    odom/gicp/correctionConsistencyDistance: 0.02
+    odom/gicp/correctionConsistencyRotation: 0.5
+
+    odom/covariance/pose/diagonal: [ 0.01, 0.01, 1000.0, 1000.0, 1000.0, 0.007615435 ]
+    odom/covariance/twist/diagonal: [ 0.04, 0.04, 1000.0, 1000.0, 1000.0, 0.030461742 ]
+    odom/covariance/degradedAfter: 0.2
+    odom/covariance/posePositionRate: 0.5
+    odom/covariance/poseYawRate: 0.25
+    odom/covariance/twistLinearRate: 0.5
+    odom/covariance/twistYawRate: 0.25
+    odom/covariance/recoveryScale: 10.0
+    odom/covariance/recoveryScans: 3
+    odom/publish/maxScanAge: 0.2
+    odom/recovery/enabled: true
+    odom/recovery/rejectedScans: 20
+    odom/recovery/confirmationScans: 3
+
     extrinsics/baselink2imu/t: [ -0.038, 0.02329, 0.11939 ]
     extrinsics/baselink2imu/R: [ 1.,  0.,  0.,
                                  0.,  1.,  0.,

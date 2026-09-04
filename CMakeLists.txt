@@ -20,6 +20,7 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -83,6 +84,7 @@ target_link_libraries(dlio_odom_component
   tf2_ros::tf2_ros
   pcl_conversions::pcl_conversions
   nav_msgs::nav_msgs__rosidl_typesupport_cpp
+  diagnostic_msgs::diagnostic_msgs__rosidl_typesupport_cpp
   sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
   geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
 )
@@ -102,6 +104,7 @@ target_link_libraries(dlio_odom_node
   tf2_ros::tf2_ros
   pcl_conversions::pcl_conversions
   nav_msgs::nav_msgs__rosidl_typesupport_cpp
+  diagnostic_msgs::diagnostic_msgs__rosidl_typesupport_cpp
   sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
   geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
 )
@@ -118,7 +121,7 @@ target_link_libraries(dlio_map_node
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs pcl_ros)
+ament_export_dependencies(rclcpp rclcpp_components std_msgs sensor_msgs geometry_msgs nav_msgs diagnostic_msgs pcl_ros)
 ament_package()
 
 # Binaries

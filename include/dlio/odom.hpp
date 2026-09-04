@@ -11,7 +11,14 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
+
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <mutex>
+#include <string>
 
 // BOOST
 #include <boost/format.hpp>
@@ -43,7 +50,46 @@ public:
 private:
 
   struct State;
-  struct ImuMeas;
+  struct ImuMeas {
+    double stamp;
+    double dt;
+    // Measurements transformed into base_link but not bias-corrected. A single
+    // bias snapshot is applied to a copied integration interval.
+    Eigen::Vector3f ang_vel;
+    Eigen::Vector3f lin_accel;
+  };
+
+  struct ImuCalibrationSample {
+    double stamp;
+    Eigen::Vector3f ang_vel;
+    Eigen::Vector3f lin_accel;
+  };
+
+  enum class ImuIntegrationStatus : uint8_t {
+    kSuccess,
+    kInvalidRange,
+    kImuTimeout,
+    kHistoryUnavailable,
+    kImuGap,
+    kIncomplete,
+  };
+
+  enum class RecoveryState : uint8_t {
+    kTracking,
+    kReseedPending,
+    kConfirming,
+  };
+
+  struct ImuIntegrationResult {
+    ImuIntegrationStatus status = ImuIntegrationStatus::kInvalidRange;
+    std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
+    Eigen::Vector3f anchor_velocity = Eigen::Vector3f::Zero();
+    double oldest_imu_stamp = 0.0;
+    double newest_imu_stamp = 0.0;
+    std::string reason;
+
+    bool ok() const { return status == ImuIntegrationStatus::kSuccess; }
+  };
 
   void getParams();
 
@@ -51,6 +97,10 @@ private:
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
 
   void publishPose();
+  void publishScanOdometry();
+  void publishDiagnostics();
+  nav_msgs::msg::Odometry makeOdometryMessage(
+    const State& state_snapshot, const rclcpp::Time& stamp, double covariance_scale) const;
 
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
@@ -58,25 +108,27 @@ private:
                        pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp);
 
   void getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
-  void preprocessPoints();
-  void deskewPointcloud();
+  bool preprocessPoints();
+  bool deskewPointcloud();
   void initializeInputTarget();
   void setInputSource();
 
   void initializeDLIO();
 
-  void getNextPose();
-  bool imuMeasFromTimeRange(double start_time, double end_time,
+  bool getNextPose();
+  bool imuMeasFromTimeRange(boost::circular_buffer<ImuMeas>& imu_snapshot,
+                            double start_time, double end_time,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
-  std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+  ImuIntegrationResult
     integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                  const std::vector<double>& sorted_timestamps);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                          const std::vector<double>& sorted_timestamps,
                          boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
+                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                         std::size_t anchor_index, Eigen::Vector3f& anchor_velocity);
   void propagateGICP();
 
   void propagateState();
@@ -89,7 +141,36 @@ private:
   void computeSpaciousness();
   void computeDensity();
 
-  sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu);
+  sensor_msgs::msg::Imu::SharedPtr transformImu(
+    const sensor_msgs::msg::Imu::SharedPtr& imu, double dt);
+
+  void rejectScan(const ImuIntegrationResult& result, bool reanchor);
+  void rejectScan(
+    const std::string& reason, bool preserve_pending_correction = false);
+  void markScanAccepted();
+  void markOdometryUnhealthy(const std::string& reason);
+  void setPredictionAnchor(
+    const Eigen::Matrix4f& pose, const Eigen::Vector3f& velocity, double stamp);
+  void resetPredictionAnchorToTrustedPose(double stamp);
+  void scheduleRecovery(uint64_t rejected_count);
+  bool submapReadyForRecovery();
+  void reseedLocalMap();
+  bool recoveryRegistrationConfirmed();
+  const char* recoveryStateName() const;
+  bool odometryOutputHealthy() const;
+  void setOdometryCovariance(
+    nav_msgs::msg::Odometry& message, double stamp_seconds, double scale) const;
+  bool updateImuCalibration(
+    double stamp, const Eigen::Vector3f& ang_vel, const Eigen::Vector3f& lin_accel);
+  void updateOnlineGyroBias(
+    double stamp, double dt, const Eigen::Vector3f& ang_vel,
+    const Eigen::Vector3f& lin_accel);
+  void updateAcceptedLidarMotion();
+  bool validateRegistrationQuality(std::string& reason);
+  bool correctionNeedsConfirmation(
+    const Eigen::Matrix4f& correction, double correction_distance,
+    double correction_rotation_deg, std::string& reason);
+  void recordAcceptedRegistrationQuality();
 
   void updateKeyframes();
   void computeConvexHull();
@@ -102,6 +183,7 @@ private:
   void debug();
 
   rclcpp::TimerBase::SharedPtr publish_timer;
+  rclcpp::TimerBase::SharedPtr diagnostics_timer;
 
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub;
@@ -110,11 +192,13 @@ private:
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr scan_odom_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
@@ -224,21 +308,55 @@ private:
   }; Extrinsics extrinsics;
 
   // IMU
-  rclcpp::Time imu_stamp;
-  double first_imu_stamp;
   double prev_imu_stamp;
+  double last_received_imu_stamp_;
   double imu_dp, imu_dq_deg;
-
-  struct ImuMeas {
-    double stamp;
-    double dt; // defined as the difference between the current and the previous measurement
-    Eigen::Vector3f ang_vel;
-    Eigen::Vector3f lin_accel;
-  }; ImuMeas imu_meas;
+  ImuMeas imu_meas;
 
   boost::circular_buffer<ImuMeas> imu_buffer;
   std::mutex mtx_imu;
   std::condition_variable cv_imu_stamp;
+  std::atomic<int64_t> latest_imu_stamp_ns_{0};
+  std::atomic<double> last_accepted_scan_stamp_{0.0};
+  std::atomic<int64_t> last_accepted_steady_ns_{0};
+  std::atomic<bool> temporal_reanchor_pending_{false};
+  std::atomic<bool> odom_ready_{false};
+  std::atomic<bool> imu_healthy_{false};
+  std::atomic<bool> scan_healthy_{false};
+  std::atomic<uint64_t> consecutive_rejected_scans_{0};
+  std::atomic<int> recovery_scans_remaining_{0};
+  std::atomic<RecoveryState> recovery_state_{RecoveryState::kTracking};
+  std::atomic<uint64_t> recovery_reseed_count_{0};
+  std::atomic<int> recovery_confirmation_count_{0};
+  Eigen::Vector3f prediction_anchor_position_ = Eigen::Vector3f::Zero();
+  Eigen::Quaternionf prediction_anchor_orientation_ = Eigen::Quaternionf::Identity();
+  Eigen::Vector3f prediction_anchor_velocity_ = Eigen::Vector3f::Zero();
+  double prediction_anchor_stamp_ = 0.0;
+  std::atomic<double> prediction_anchor_diagnostic_stamp_{0.0};
+  mutable std::mutex health_mutex_;
+  std::string health_reason_;
+
+  std::deque<ImuCalibrationSample> imu_calibration_samples_;
+  std::deque<ImuCalibrationSample> online_bias_samples_;
+  Eigen::Vector3f startup_gyro_bias_ = Eigen::Vector3f::Zero();
+
+  bool accepted_lidar_pose_available_ = false;
+  Eigen::Vector3f previous_accepted_lidar_position_ = Eigen::Vector3f::Zero();
+  Eigen::Quaternionf previous_accepted_lidar_orientation_ = Eigen::Quaternionf::Identity();
+  double previous_accepted_lidar_stamp_ = 0.0;
+  std::atomic<double> accepted_lidar_linear_speed_{
+    std::numeric_limits<double>::infinity()};
+  std::atomic<double> accepted_lidar_angular_speed_{
+    std::numeric_limits<double>::infinity()};
+
+  std::deque<double> registration_error_history_;
+  std::deque<double> registration_condition_history_;
+  std::atomic<double> last_correspondence_ratio_{0.0};
+  std::atomic<double> last_normalized_registration_error_{0.0};
+  std::atomic<double> last_hessian_condition_{0.0};
+  bool pending_correction_valid_ = false;
+  Eigen::Matrix4f pending_correction_ = Eigen::Matrix4f::Identity();
+  int pending_correction_count_ = 0;
 
   static bool comparatorImu(ImuMeas m1, ImuMeas m2) {
     return (m1.stamp < m2.stamp);
@@ -340,7 +458,20 @@ private:
   bool calibrate_accel_;
   bool gravity_align_;
   double imu_calib_time_;
+  int imu_calibration_min_samples_;
+  double imu_calibration_gyro_stddev_max_;
+  double imu_calibration_gyro_mean_max_;
+  double imu_calibration_accel_norm_stddev_max_;
+  double imu_calibration_accel_gravity_tolerance_;
+  bool online_gyro_bias_enabled_;
+  double online_gyro_bias_stationary_time_;
+  double online_gyro_bias_lidar_linear_max_;
+  double online_gyro_bias_lidar_angular_max_deg_;
+  double online_gyro_bias_time_constant_;
+  double online_gyro_bias_max_delta_;
   int imu_buffer_size_;
+  double imu_max_gap_seconds_;
+  double imu_wait_timeout_seconds_;
   Eigen::Matrix3f imu_accel_sm_;
 
   int gicp_min_num_points_;
@@ -350,6 +481,33 @@ private:
   double gicp_transformation_ep_;
   double gicp_rotation_ep_;
   double gicp_init_lambda_factor_;
+  double gicp_max_correction_distance_;
+  double gicp_max_correction_rotation_deg_;
+  double gicp_min_correspondence_ratio_;
+  int gicp_quality_history_size_;
+  int gicp_quality_warmup_scans_;
+  double gicp_max_normalized_error_factor_;
+  double gicp_max_hessian_condition_;
+  double gicp_max_hessian_condition_factor_;
+  double gicp_soft_correction_distance_;
+  double gicp_soft_correction_rotation_deg_;
+  int gicp_correction_confirmation_scans_;
+  double gicp_correction_consistency_distance_;
+  double gicp_correction_consistency_rotation_deg_;
+
+  std::vector<double> pose_covariance_diagonal_;
+  std::vector<double> twist_covariance_diagonal_;
+  double covariance_degraded_after_seconds_;
+  double covariance_pose_position_rate_;
+  double covariance_pose_yaw_rate_;
+  double covariance_twist_linear_rate_;
+  double covariance_twist_yaw_rate_;
+  double covariance_recovery_scale_;
+  int covariance_recovery_scans_;
+  double odom_publish_max_scan_age_;
+  bool recovery_enabled_;
+  int recovery_rejected_scans_;
+  int recovery_confirmation_scans_;
 
   double geo_Kp_;
   double geo_Kv_;

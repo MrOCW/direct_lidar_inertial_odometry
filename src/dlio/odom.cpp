@@ -13,15 +13,46 @@
 #include "dlio/odom.hpp"
 #include "dlio/utils.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <functional>
+#include <numeric>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
 
+#include <Eigen/SVD>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
 #include "rclcpp/qos.hpp"
 namespace dlio
 {
 
 namespace
 {
+class ScopeExit
+{
+public:
+  explicit ScopeExit(std::function<void()> callback)
+  : callback_(std::move(callback)) {}
+
+  ~ScopeExit() { run(); }
+
+  void run()
+  {
+    if (active_) {
+      active_ = false;
+      callback_();
+    }
+  }
+
+private:
+  std::function<void()> callback_;
+  bool active_ = true;
+};
+
 rclcpp::QoS makeSensorQos(int depth, const std::string & reliability)
 {
   if (depth <= 0) {
@@ -73,16 +104,23 @@ OdomNode::OdomNode(const rclcpp::NodeOptions & options)
       std::bind(&OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
 
   this->odom_pub     = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
+  this->scan_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("odom_scan", 1);
   this->pose_pub     = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 1);
   this->path_pub     = this->create_publisher<nav_msgs::msg::Path>("path", 1);
   this->kf_pose_pub  = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+  this->diagnostics_pub =
+    this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&OdomNode::publishPose, this));
+  this->diagnostics_timer = this->create_wall_timer(
+      std::chrono::seconds(1), std::bind(&OdomNode::publishDiagnostics, this));
+
+  this->health_reason_ = "waiting for the first accepted LiDAR scan";
 
   this->T = Eigen::Matrix4f::Identity();
   this->T_prior = Eigen::Matrix4f::Identity();
@@ -108,8 +146,9 @@ OdomNode::OdomNode(const rclcpp::NodeOptions & options)
   this->imu_meas.lin_accel[2] = 0.;
 
   this->imu_buffer.set_capacity(this->imu_buffer_size_);
-  this->first_imu_stamp = 0.;
   this->prev_imu_stamp = 0.;
+  this->last_received_imu_stamp_ = 0.;
+  this->startup_gyro_bias_ = this->state.b.gyro;
 
   this->original_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->deskewed_scan = std::make_shared<const pcl::PointCloud<PointType>>();
@@ -300,7 +339,31 @@ void OdomNode::getParams() {
   declare_param(this, "odom/imu/calibration/accel", this->calibrate_accel_, true);
   declare_param(this, "odom/imu/calibration/gyro", this->calibrate_gyro_, true);
   declare_param(this, "odom/imu/calibration/time", this->imu_calib_time_, 3.0);
+  declare_param(this, "odom/imu/calibration/minSamples",
+    this->imu_calibration_min_samples_, 400);
+  declare_param(this, "odom/imu/calibration/gyroStddevMax",
+    this->imu_calibration_gyro_stddev_max_, 0.005);
+  declare_param(this, "odom/imu/calibration/gyroMeanMax",
+    this->imu_calibration_gyro_mean_max_, 0.05);
+  declare_param(this, "odom/imu/calibration/accelNormStddevMax",
+    this->imu_calibration_accel_norm_stddev_max_, 0.08);
+  declare_param(this, "odom/imu/calibration/accelGravityTolerance",
+    this->imu_calibration_accel_gravity_tolerance_, 0.5);
+  declare_param(this, "odom/imu/onlineGyroBias/enabled",
+    this->online_gyro_bias_enabled_, true);
+  declare_param(this, "odom/imu/onlineGyroBias/stationaryTime",
+    this->online_gyro_bias_stationary_time_, 2.0);
+  declare_param(this, "odom/imu/onlineGyroBias/lidarLinearMax",
+    this->online_gyro_bias_lidar_linear_max_, 0.02);
+  declare_param(this, "odom/imu/onlineGyroBias/lidarAngularMax",
+    this->online_gyro_bias_lidar_angular_max_deg_, 0.5);
+  declare_param(this, "odom/imu/onlineGyroBias/timeConstant",
+    this->online_gyro_bias_time_constant_, 30.0);
+  declare_param(this, "odom/imu/onlineGyroBias/maxDelta",
+    this->online_gyro_bias_max_delta_, 0.05);
   declare_param(this, "odom/imu/bufferSize", this->imu_buffer_size_, 2000);
+  declare_param(this, "odom/imu/maxGap", this->imu_max_gap_seconds_, 0.05);
+  declare_param(this, "odom/imu/waitTimeout", this->imu_wait_timeout_seconds_, 0.05);
 
   std::vector<double> accel_default{0., 0., 0.}; std::vector<double> prior_accel_bias;
   std::vector<double> gyro_default{0., 0., 0.}; std::vector<double> prior_gyro_bias;
@@ -339,6 +402,130 @@ void OdomNode::getParams() {
   declare_param(this, "odom/gicp/transformationEpsilon", this->gicp_transformation_ep_, 0.0005);
   declare_param(this, "odom/gicp/rotationEpsilon", this->gicp_rotation_ep_, 0.0005);
   declare_param(this, "odom/gicp/initLambdaFactor", this->gicp_init_lambda_factor_, 1e-9);
+  declare_param(this, "odom/gicp/maxCorrectionDistance",
+    this->gicp_max_correction_distance_, 1.0);
+  declare_param(this, "odom/gicp/maxCorrectionRotation",
+    this->gicp_max_correction_rotation_deg_, 45.0);
+  declare_param(this, "odom/gicp/minCorrespondenceRatio",
+    this->gicp_min_correspondence_ratio_, 0.20);
+  declare_param(this, "odom/gicp/qualityHistorySize",
+    this->gicp_quality_history_size_, 50);
+  declare_param(this, "odom/gicp/qualityWarmupScans",
+    this->gicp_quality_warmup_scans_, 20);
+  declare_param(this, "odom/gicp/maxNormalizedErrorFactor",
+    this->gicp_max_normalized_error_factor_, 3.0);
+  declare_param(this, "odom/gicp/maxHessianCondition",
+    this->gicp_max_hessian_condition_, 1.0e8);
+  declare_param(this, "odom/gicp/maxHessianConditionFactor",
+    this->gicp_max_hessian_condition_factor_, 10.0);
+  declare_param(this, "odom/gicp/softCorrectionDistance",
+    this->gicp_soft_correction_distance_, 0.06);
+  declare_param(this, "odom/gicp/softCorrectionRotation",
+    this->gicp_soft_correction_rotation_deg_, 1.0);
+  declare_param(this, "odom/gicp/correctionConfirmationScans",
+    this->gicp_correction_confirmation_scans_, 2);
+  declare_param(this, "odom/gicp/correctionConsistencyDistance",
+    this->gicp_correction_consistency_distance_, 0.02);
+  declare_param(this, "odom/gicp/correctionConsistencyRotation",
+    this->gicp_correction_consistency_rotation_deg_, 0.5);
+
+  declare_param(this, "odom/covariance/pose/diagonal", this->pose_covariance_diagonal_,
+    std::vector<double>{0.01, 0.01, 1000.0, 1000.0, 1000.0, 0.007615435});
+  declare_param(this, "odom/covariance/twist/diagonal", this->twist_covariance_diagonal_,
+    std::vector<double>{0.04, 0.04, 1000.0, 1000.0, 1000.0, 0.030461742});
+  declare_param(this, "odom/covariance/degradedAfter",
+    this->covariance_degraded_after_seconds_, 0.2);
+  declare_param(this, "odom/covariance/posePositionRate",
+    this->covariance_pose_position_rate_, 0.5);
+  declare_param(this, "odom/covariance/poseYawRate",
+    this->covariance_pose_yaw_rate_, 0.25);
+  declare_param(this, "odom/covariance/twistLinearRate",
+    this->covariance_twist_linear_rate_, 0.5);
+  declare_param(this, "odom/covariance/twistYawRate",
+    this->covariance_twist_yaw_rate_, 0.25);
+  declare_param(this, "odom/covariance/recoveryScale",
+    this->covariance_recovery_scale_, 10.0);
+  declare_param(this, "odom/covariance/recoveryScans",
+    this->covariance_recovery_scans_, 3);
+  declare_param(this, "odom/publish/maxScanAge",
+    this->odom_publish_max_scan_age_, 0.2);
+  declare_param(this, "odom/recovery/enabled", this->recovery_enabled_, true);
+  declare_param(this, "odom/recovery/rejectedScans",
+    this->recovery_rejected_scans_, 20);
+  declare_param(this, "odom/recovery/confirmationScans",
+    this->recovery_confirmation_scans_, 3);
+
+  const auto valid_diagonal = [](const std::vector<double>& diagonal) {
+      return diagonal.size() == 6 &&
+        std::all_of(diagonal.begin(), diagonal.end(), [](double value) {
+          return std::isfinite(value) && value > 0.0;
+        });
+    };
+  if (!valid_diagonal(this->pose_covariance_diagonal_) ||
+      !valid_diagonal(this->twist_covariance_diagonal_)) {
+    throw std::invalid_argument("DLIO covariance diagonals must contain six positive values");
+  }
+  if (!std::isfinite(this->imu_calib_time_) || this->imu_calib_time_ <= 0.0 ||
+      this->imu_calibration_min_samples_ < 2 ||
+      !std::isfinite(this->imu_calibration_gyro_stddev_max_) ||
+      this->imu_calibration_gyro_stddev_max_ <= 0.0 ||
+      !std::isfinite(this->imu_calibration_gyro_mean_max_) ||
+      this->imu_calibration_gyro_mean_max_ <= 0.0 ||
+      !std::isfinite(this->imu_calibration_accel_norm_stddev_max_) ||
+      this->imu_calibration_accel_norm_stddev_max_ <= 0.0 ||
+      !std::isfinite(this->imu_calibration_accel_gravity_tolerance_) ||
+      this->imu_calibration_accel_gravity_tolerance_ <= 0.0 ||
+      !std::isfinite(this->online_gyro_bias_stationary_time_) ||
+      this->online_gyro_bias_stationary_time_ <= 0.0 ||
+      !std::isfinite(this->online_gyro_bias_lidar_linear_max_) ||
+      this->online_gyro_bias_lidar_linear_max_ <= 0.0 ||
+      !std::isfinite(this->online_gyro_bias_lidar_angular_max_deg_) ||
+      this->online_gyro_bias_lidar_angular_max_deg_ <= 0.0 ||
+      !std::isfinite(this->online_gyro_bias_time_constant_) ||
+      this->online_gyro_bias_time_constant_ <= 0.0 ||
+      !std::isfinite(this->online_gyro_bias_max_delta_) ||
+      this->online_gyro_bias_max_delta_ <= 0.0 ||
+      !std::isfinite(this->imu_max_gap_seconds_) || this->imu_max_gap_seconds_ <= 0.0 ||
+      !std::isfinite(this->imu_wait_timeout_seconds_) || this->imu_wait_timeout_seconds_ <= 0.0 ||
+      !std::isfinite(this->gicp_max_correction_distance_) ||
+      this->gicp_max_correction_distance_ <= 0.0 ||
+      !std::isfinite(this->gicp_max_correction_rotation_deg_) ||
+      this->gicp_max_correction_rotation_deg_ <= 0.0 ||
+      !std::isfinite(this->gicp_min_correspondence_ratio_) ||
+      this->gicp_min_correspondence_ratio_ <= 0.0 || this->gicp_min_correspondence_ratio_ > 1.0 ||
+      this->gicp_quality_history_size_ < 1 || this->gicp_quality_warmup_scans_ < 1 ||
+      !std::isfinite(this->gicp_max_normalized_error_factor_) ||
+      this->gicp_max_normalized_error_factor_ <= 1.0 ||
+      !std::isfinite(this->gicp_max_hessian_condition_) ||
+      this->gicp_max_hessian_condition_ <= 1.0 ||
+      !std::isfinite(this->gicp_max_hessian_condition_factor_) ||
+      this->gicp_max_hessian_condition_factor_ <= 1.0 ||
+      !std::isfinite(this->gicp_soft_correction_distance_) ||
+      this->gicp_soft_correction_distance_ <= 0.0 ||
+      !std::isfinite(this->gicp_soft_correction_rotation_deg_) ||
+      this->gicp_soft_correction_rotation_deg_ <= 0.0 ||
+      this->gicp_correction_confirmation_scans_ < 1 ||
+      !std::isfinite(this->gicp_correction_consistency_distance_) ||
+      this->gicp_correction_consistency_distance_ <= 0.0 ||
+      !std::isfinite(this->gicp_correction_consistency_rotation_deg_) ||
+      this->gicp_correction_consistency_rotation_deg_ <= 0.0 ||
+      !std::isfinite(this->covariance_degraded_after_seconds_) ||
+      this->covariance_degraded_after_seconds_ < 0.0 ||
+      !std::isfinite(this->covariance_pose_position_rate_) ||
+      this->covariance_pose_position_rate_ < 0.0 ||
+      !std::isfinite(this->covariance_pose_yaw_rate_) ||
+      this->covariance_pose_yaw_rate_ < 0.0 ||
+      !std::isfinite(this->covariance_twist_linear_rate_) ||
+      this->covariance_twist_linear_rate_ < 0.0 ||
+      !std::isfinite(this->covariance_twist_yaw_rate_) ||
+      this->covariance_twist_yaw_rate_ < 0.0 ||
+      !std::isfinite(this->covariance_recovery_scale_) ||
+      this->covariance_recovery_scale_ < 1.0 || this->covariance_recovery_scans_ < 0 ||
+      !std::isfinite(this->odom_publish_max_scan_age_) ||
+      this->odom_publish_max_scan_age_ <= 0.0 || this->recovery_rejected_scans_ < 1 ||
+      this->recovery_confirmation_scans_ < 1) {
+    throw std::invalid_argument("DLIO timing, correction, and covariance parameters are invalid");
+  }
 
   // Geometric Observer
   declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0);
@@ -361,66 +548,244 @@ void OdomNode::start() {
 
 }
 
+void OdomNode::setOdometryCovariance(
+    nav_msgs::msg::Odometry& message, double stamp_seconds, double scale) const {
+  message.pose.covariance.fill(0.0);
+  message.twist.covariance.fill(0.0);
+
+  for (size_t index = 0; index < 6; ++index) {
+    message.pose.covariance[index * 6 + index] =
+      scale * this->pose_covariance_diagonal_[index];
+    message.twist.covariance[index * 6 + index] =
+      scale * this->twist_covariance_diagonal_[index];
+  }
+
+  const double last_accepted = this->last_accepted_scan_stamp_.load();
+  const double degraded_age = std::max(
+    0.0, stamp_seconds - last_accepted - this->covariance_degraded_after_seconds_);
+  if (last_accepted <= 0.0 || degraded_age <= 0.0) {
+    return;
+  }
+
+  const double pose_position_increase =
+    this->covariance_pose_position_rate_ * degraded_age;
+  const double pose_yaw_increase = this->covariance_pose_yaw_rate_ * degraded_age;
+  const double twist_linear_increase =
+    this->covariance_twist_linear_rate_ * degraded_age;
+  const double twist_yaw_increase = this->covariance_twist_yaw_rate_ * degraded_age;
+
+  message.pose.covariance[0] += pose_position_increase;
+  message.pose.covariance[7] += pose_position_increase;
+  message.pose.covariance[35] += pose_yaw_increase;
+  message.twist.covariance[0] += twist_linear_increase;
+  message.twist.covariance[7] += twist_linear_increase;
+  message.twist.covariance[35] += twist_yaw_increase;
+}
+
+nav_msgs::msg::Odometry OdomNode::makeOdometryMessage(
+    const State& state_snapshot, const rclcpp::Time& stamp, double covariance_scale) const {
+  nav_msgs::msg::Odometry message;
+  message.header.stamp = stamp;
+  message.header.frame_id = this->odom_frame;
+  message.child_frame_id = this->baselink_frame;
+
+  message.pose.pose.position.x = state_snapshot.p[0];
+  message.pose.pose.position.y = state_snapshot.p[1];
+  message.pose.pose.position.z = state_snapshot.p[2];
+  message.pose.pose.orientation.w = state_snapshot.q.w();
+  message.pose.pose.orientation.x = state_snapshot.q.x();
+  message.pose.pose.orientation.y = state_snapshot.q.y();
+  message.pose.pose.orientation.z = state_snapshot.q.z();
+
+  message.twist.twist.linear.x = state_snapshot.v.lin.w[0];
+  message.twist.twist.linear.y = state_snapshot.v.lin.w[1];
+  message.twist.twist.linear.z = state_snapshot.v.lin.w[2];
+  message.twist.twist.angular.x = state_snapshot.v.ang.b[0];
+  message.twist.twist.angular.y = state_snapshot.v.ang.b[1];
+  message.twist.twist.angular.z = state_snapshot.v.ang.b[2];
+
+  this->setOdometryCovariance(message, stamp.seconds(), covariance_scale);
+  return message;
+}
+
+bool OdomNode::odometryOutputHealthy() const {
+  if (!this->odom_ready_.load() || !this->imu_healthy_.load() ||
+      !this->scan_healthy_.load()) {
+    return false;
+  }
+
+  const int64_t accepted_ns = this->last_accepted_steady_ns_.load();
+  if (accepted_ns <= 0) {
+    return false;
+  }
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  return static_cast<double>(now_ns - accepted_ns) * 1e-9 <=
+    this->odom_publish_max_scan_age_;
+}
+
 void OdomNode::publishPose() {
 
-  // nav_msgs::msg::Odometry
-  this->odom_ros.header.stamp = this->imu_stamp;
-  this->odom_ros.header.frame_id = this->odom_frame;
-  this->odom_ros.child_frame_id = this->baselink_frame;
+  if (!this->odometryOutputHealthy()) {
+    return;
+  }
 
-  this->odom_ros.pose.pose.position.x = this->state.p[0];
-  this->odom_ros.pose.pose.position.y = this->state.p[1];
-  this->odom_ros.pose.pose.position.z = this->state.p[2];
+  const int64_t imu_stamp_ns = this->latest_imu_stamp_ns_.load();
+  if (imu_stamp_ns <= 0) {
+    return;
+  }
 
-  this->odom_ros.pose.pose.orientation.w = this->state.q.w();
-  this->odom_ros.pose.pose.orientation.x = this->state.q.x();
-  this->odom_ros.pose.pose.orientation.y = this->state.q.y();
-  this->odom_ros.pose.pose.orientation.z = this->state.q.z();
+  State state_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    state_snapshot = this->state;
+  }
+  const rclcpp::Time publish_stamp(imu_stamp_ns);
+  const double covariance_scale = this->recovery_scans_remaining_.load() > 0 ?
+    this->covariance_recovery_scale_ : 1.0;
 
-  this->odom_ros.twist.twist.linear.x = this->state.v.lin.w[0];
-  this->odom_ros.twist.twist.linear.y = this->state.v.lin.w[1];
-  this->odom_ros.twist.twist.linear.z = this->state.v.lin.w[2];
-
-  this->odom_ros.twist.twist.angular.x = this->state.v.ang.b[0];
-  this->odom_ros.twist.twist.angular.y = this->state.v.ang.b[1];
-  this->odom_ros.twist.twist.angular.z = this->state.v.ang.b[2];
-
-  this->odom_pub->publish(this->odom_ros);
+  this->odom_pub->publish(
+    this->makeOdometryMessage(state_snapshot, publish_stamp, covariance_scale));
 
   // geometry_msgs::msg::PoseStamped
-  this->pose_ros.header.stamp = this->imu_stamp;
+  this->pose_ros.header.stamp = publish_stamp;
   this->pose_ros.header.frame_id = this->odom_frame;
 
-  this->pose_ros.pose.position.x = this->state.p[0];
-  this->pose_ros.pose.position.y = this->state.p[1];
-  this->pose_ros.pose.position.z = this->state.p[2];
+  this->pose_ros.pose.position.x = state_snapshot.p[0];
+  this->pose_ros.pose.position.y = state_snapshot.p[1];
+  this->pose_ros.pose.position.z = state_snapshot.p[2];
 
-  this->pose_ros.pose.orientation.w = this->state.q.w();
-  this->pose_ros.pose.orientation.x = this->state.q.x();
-  this->pose_ros.pose.orientation.y = this->state.q.y();
-  this->pose_ros.pose.orientation.z = this->state.q.z();
+  this->pose_ros.pose.orientation.w = state_snapshot.q.w();
+  this->pose_ros.pose.orientation.x = state_snapshot.q.x();
+  this->pose_ros.pose.orientation.y = state_snapshot.q.y();
+  this->pose_ros.pose.orientation.z = state_snapshot.q.z();
 
   this->pose_pub->publish(this->pose_ros);
 
 }
 
+void OdomNode::publishScanOdometry() {
+  if (!std::isfinite(this->scan_stamp) || this->scan_stamp <= 0.0 ||
+      !this->odometryOutputHealthy()) {
+    return;
+  }
+
+  State state_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    state_snapshot = this->state;
+  }
+
+  int recovery_remaining = this->recovery_scans_remaining_.load();
+  const double covariance_scale = recovery_remaining > 0 ?
+    this->covariance_recovery_scale_ : 1.0;
+  this->scan_odom_pub->publish(this->makeOdometryMessage(
+    state_snapshot,
+    rclcpp::Time(static_cast<int64_t>(std::llround(this->scan_stamp * 1.0e9))),
+    covariance_scale));
+
+  while (recovery_remaining > 0 &&
+      !this->recovery_scans_remaining_.compare_exchange_weak(
+        recovery_remaining, recovery_remaining - 1)) {}
+}
+
+void OdomNode::publishDiagnostics() {
+  diagnostic_msgs::msg::DiagnosticArray array;
+  array.header.stamp = this->now();
+
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "DLIO: Odometry Health";
+  status.hardware_id = "livox_mid360";
+
+  double accepted_age = std::numeric_limits<double>::infinity();
+  const int64_t accepted_ns = this->last_accepted_steady_ns_.load();
+  if (accepted_ns > 0) {
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    accepted_age = static_cast<double>(now_ns - accepted_ns) * 1e-9;
+  }
+
+  const bool calibrated = this->imu_calibrated.load();
+  const bool healthy = this->odometryOutputHealthy();
+  if (!calibrated) {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    status.message = "waiting for stationary IMU calibration";
+  } else if (!this->odom_ready_.load()) {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    status.message = "waiting for the first accepted LiDAR scan";
+  } else if (!healthy) {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    if (!this->imu_healthy_.load() || !this->scan_healthy_.load()) {
+      std::lock_guard<std::mutex> lock(this->health_mutex_);
+      status.message = this->health_reason_;
+    } else {
+      std::ostringstream message;
+      message << "no accepted LiDAR scan within "
+              << this->odom_publish_max_scan_age_ << " s";
+      status.message = message.str();
+    }
+  } else {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = "scan-corrected odometry is healthy";
+  }
+
+  const auto add_value = [&status](const std::string& key, const auto& value) {
+      diagnostic_msgs::msg::KeyValue item;
+      item.key = key;
+      std::ostringstream stream;
+      stream << value;
+      item.value = stream.str();
+      status.values.push_back(std::move(item));
+    };
+
+  Eigen::Vector3f gyro_bias;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    gyro_bias = this->state.b.gyro;
+  }
+  add_value("last_accepted_scan_age_s", accepted_age);
+  add_value("consecutive_rejected_scans", this->consecutive_rejected_scans_.load());
+  add_value("recovery_state", this->recoveryStateName());
+  add_value("recovery_reseed_count", this->recovery_reseed_count_.load());
+  add_value("recovery_confirmation_count", this->recovery_confirmation_count_.load());
+  add_value("prediction_anchor_stamp", this->prediction_anchor_diagnostic_stamp_.load());
+  add_value("imu_healthy", this->imu_healthy_.load());
+  add_value("scan_healthy", this->scan_healthy_.load());
+  add_value("correspondence_ratio", this->last_correspondence_ratio_.load());
+  add_value("normalized_registration_error",
+    this->last_normalized_registration_error_.load());
+  add_value("hessian_condition", this->last_hessian_condition_.load());
+  add_value("gyro_bias_x", gyro_bias.x());
+  add_value("gyro_bias_y", gyro_bias.y());
+  add_value("gyro_bias_z", gyro_bias.z());
+  array.status.push_back(std::move(status));
+  this->diagnostics_pub->publish(array);
+}
+
 void OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
   this->publishCloud(published_cloud, T_cloud);
 
+  const rclcpp::Time publish_stamp(this->latest_imu_stamp_ns_.load());
+  State state_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    state_snapshot = this->state;
+  }
+
   // nav_msgs::msg::Path
-  this->path_ros.header.stamp = this->imu_stamp;
+  this->path_ros.header.stamp = publish_stamp;
   this->path_ros.header.frame_id = this->odom_frame;
 
   geometry_msgs::msg::PoseStamped p;
-  p.header.stamp = this->imu_stamp;
+  p.header.stamp = publish_stamp;
   p.header.frame_id = this->odom_frame;
-  p.pose.position.x = this->state.p[0];
-  p.pose.position.y = this->state.p[1];
-  p.pose.position.z = this->state.p[2];
-  p.pose.orientation.w = this->state.q.w();
-  p.pose.orientation.x = this->state.q.x();
-  p.pose.orientation.y = this->state.q.y();
-  p.pose.orientation.z = this->state.q.z();
+  p.pose.position.x = state_snapshot.p[0];
+  p.pose.position.y = state_snapshot.p[1];
+  p.pose.position.z = state_snapshot.p[2];
+  p.pose.orientation.w = state_snapshot.q.w();
+  p.pose.orientation.x = state_snapshot.q.x();
+  p.pose.orientation.y = state_snapshot.q.y();
+  p.pose.orientation.z = state_snapshot.q.z();
 
   this->path_ros.poses.push_back(p);
   this->path_pub->publish(this->path_ros);
@@ -429,25 +794,25 @@ void OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud
   geometry_msgs::msg::TransformStamped transformStamped;
 
   if (this->publish_odom_tf_) {
-    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.stamp = publish_stamp;
     transformStamped.header.frame_id = this->odom_frame;
     transformStamped.child_frame_id = this->baselink_frame;
 
-    transformStamped.transform.translation.x = this->state.p[0];
-    transformStamped.transform.translation.y = this->state.p[1];
-    transformStamped.transform.translation.z = this->state.p[2];
+    transformStamped.transform.translation.x = state_snapshot.p[0];
+    transformStamped.transform.translation.y = state_snapshot.p[1];
+    transformStamped.transform.translation.z = state_snapshot.p[2];
 
-    transformStamped.transform.rotation.w = this->state.q.w();
-    transformStamped.transform.rotation.x = this->state.q.x();
-    transformStamped.transform.rotation.y = this->state.q.y();
-    transformStamped.transform.rotation.z = this->state.q.z();
+    transformStamped.transform.rotation.w = state_snapshot.q.w();
+    transformStamped.transform.rotation.x = state_snapshot.q.x();
+    transformStamped.transform.rotation.y = state_snapshot.q.y();
+    transformStamped.transform.rotation.z = state_snapshot.q.z();
 
     br->sendTransform(transformStamped);
   }
 
   if (this->publish_sensor_tf_) {
     // transform: baselink to imu
-    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.stamp = publish_stamp;
     transformStamped.header.frame_id = this->baselink_frame;
     transformStamped.child_frame_id = this->imu_frame;
 
@@ -464,7 +829,7 @@ void OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud
     br->sendTransform(transformStamped);
 
     // transform: baselink to lidar
-    transformStamped.header.stamp = this->imu_stamp;
+    transformStamped.header.stamp = publish_stamp;
     transformStamped.header.frame_id = this->baselink_frame;
     transformStamped.child_frame_id = this->lidar_frame;
 
@@ -588,43 +953,271 @@ void OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc
 
 }
 
-void OdomNode::preprocessPoints() {
+void OdomNode::setPredictionAnchor(
+    const Eigen::Matrix4f& pose, const Eigen::Vector3f& velocity, double stamp) {
+  Eigen::Quaternionf orientation(pose.block<3, 3>(0, 0));
+  orientation.normalize();
+  this->prediction_anchor_position_ = pose.block<3, 1>(0, 3);
+  this->prediction_anchor_orientation_ = orientation;
+  this->prediction_anchor_velocity_ = velocity;
+  this->prediction_anchor_stamp_ = stamp;
+  this->prediction_anchor_diagnostic_stamp_.store(stamp);
+}
+
+void OdomNode::resetPredictionAnchorToTrustedPose(double stamp) {
+  this->setPredictionAnchor(this->T, Eigen::Vector3f::Zero(), stamp);
+}
+
+const char* OdomNode::recoveryStateName() const {
+  switch (this->recovery_state_.load()) {
+    case RecoveryState::kTracking:
+      return "tracking";
+    case RecoveryState::kReseedPending:
+      return "reseed_pending";
+    case RecoveryState::kConfirming:
+      return "confirming";
+  }
+  return "unknown";
+}
+
+void OdomNode::scheduleRecovery(uint64_t rejected_count) {
+  if (!this->recovery_enabled_ ||
+      rejected_count < static_cast<uint64_t>(this->recovery_rejected_scans_) ||
+      this->recovery_state_.load() == RecoveryState::kReseedPending) {
+    return;
+  }
+
+  this->recovery_confirmation_count_.store(0);
+  this->recovery_state_.store(RecoveryState::kReseedPending);
+  {
+    std::lock_guard<std::mutex> lock(this->health_mutex_);
+    this->health_reason_ = "recovery pending after sustained LiDAR scan rejection";
+  }
+  RCLCPP_ERROR(
+    this->get_logger(),
+    "Scheduling DLIO local-map reseed after %llu consecutive rejected scans",
+    static_cast<unsigned long long>(rejected_count));
+}
+
+bool OdomNode::submapReadyForRecovery() {
+  if (!this->submap_future.valid()) {
+    return true;
+  }
+  if (this->submap_future.wait_for(std::chrono::seconds(0)) !=
+      std::future_status::ready) {
+    return false;
+  }
+  try {
+    this->submap_future.get();
+  } catch (const std::exception& exception) {
+    this->markOdometryUnhealthy(
+      std::string("submap build failed before recovery: ") + exception.what());
+    RCLCPP_ERROR(
+      this->get_logger(), "Unable to begin DLIO recovery: %s", exception.what());
+    return false;
+  }
+  return true;
+}
+
+void OdomNode::reseedLocalMap() {
+  const Eigen::Matrix4f rebase = this->T * this->T_prior.inverse();
+  auto rebased_deskewed = std::make_shared<pcl::PointCloud<PointType>>();
+  auto rebased_current = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::transformPointCloud(*this->deskewed_scan, *rebased_deskewed, rebase);
+  pcl::transformPointCloud(*this->current_scan, *rebased_current, rebase);
+  this->deskewed_scan = rebased_deskewed;
+  this->current_scan = rebased_current;
+
+  this->T_prior = this->T;
+  this->T_corr = Eigen::Matrix4f::Identity();
+  this->propagateGICP();
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    this->state.p = this->lidarPose.p;
+    this->state.q = this->lidarPose.q;
+    this->state.v.lin.b.setZero();
+    this->state.v.lin.w.setZero();
+    this->state.v.ang.b.setZero();
+    this->state.v.ang.w.setZero();
+    this->geo.prev_p = this->state.p;
+    this->geo.prev_q = this->state.q;
+    this->geo.prev_vel.setZero();
+  }
+  this->setPredictionAnchor(this->T, Eigen::Vector3f::Zero(), this->scan_stamp);
+  this->prev_scan_stamp = this->scan_stamp;
+
+  {
+    std::lock_guard<std::mutex> lock(this->keyframes_mutex);
+    this->keyframes.clear();
+    this->keyframe_timestamps.clear();
+    this->keyframe_normals.clear();
+    this->keyframe_transformations.clear();
+  }
+  this->num_processed_keyframes = 0;
+  this->keyframe_convex.clear();
+  this->keyframe_concave.clear();
+  this->submap_kf_idx_curr.clear();
+  this->submap_kf_idx_prev.clear();
+  this->submap_cloud = std::make_shared<const pcl::PointCloud<PointType>>();
+  this->submap_normals.reset();
+  this->submap_kdtree.reset();
+  this->submap_hasChanged = true;
+  this->new_submap_is_ready = false;
+
+  this->registration_error_history_.clear();
+  this->registration_condition_history_.clear();
+  this->pending_correction_valid_ = false;
+  this->pending_correction_count_ = 0;
+  this->online_bias_samples_.clear();
+  this->consecutive_rejected_scans_.store(0);
+  this->recovery_confirmation_count_.store(0);
+  this->recovery_state_.store(RecoveryState::kConfirming);
+  this->recovery_reseed_count_.fetch_add(1);
+  this->markOdometryUnhealthy("local map reseeded; confirming LiDAR registration");
+  RCLCPP_WARN(
+    this->get_logger(),
+    "Reseeded DLIO local map at the last trusted pose; waiting for %d consistent scans",
+    this->recovery_confirmation_scans_);
+}
+
+bool OdomNode::recoveryRegistrationConfirmed() {
+  const int confirmed = this->recovery_confirmation_count_.fetch_add(1) + 1;
+  if (confirmed < this->recovery_confirmation_scans_) {
+    std::ostringstream reason;
+    reason << "confirming LiDAR registration after local-map reseed (" << confirmed
+           << "/" << this->recovery_confirmation_scans_ << ")";
+    this->markOdometryUnhealthy(reason.str());
+    return false;
+  }
+
+  this->recovery_state_.store(RecoveryState::kTracking);
+  RCLCPP_INFO(
+    this->get_logger(), "DLIO recovery confirmed after %d consistent scans", confirmed);
+  return true;
+}
+
+void OdomNode::rejectScan(const ImuIntegrationResult& result, bool reanchor) {
+  const uint64_t rejected_count = this->consecutive_rejected_scans_.fetch_add(1) + 1;
+  this->markOdometryUnhealthy(result.reason);
+  this->recovery_confirmation_count_.store(0);
+  this->pending_correction_valid_ = false;
+  this->pending_correction_count_ = 0;
+  if (reanchor) {
+    // Only advance the temporal anchor. The rejected scan must never enter GICP or the map.
+    this->prev_scan_stamp = this->scan_stamp;
+    this->resetPredictionAnchorToTrustedPose(this->scan_stamp);
+  }
+  this->scheduleRecovery(rejected_count);
+
+  RCLCPP_ERROR_THROTTLE(
+    this->get_logger(), *this->get_clock(), 1000,
+    "Rejecting LiDAR scan at %.6f: %s (IMU range %.6f to %.6f, consecutive rejects: %llu)",
+    this->scan_stamp, result.reason.c_str(), result.oldest_imu_stamp,
+    result.newest_imu_stamp, static_cast<unsigned long long>(rejected_count));
+}
+
+void OdomNode::rejectScan(
+    const std::string& reason, bool preserve_pending_correction) {
+  const uint64_t rejected_count = this->consecutive_rejected_scans_.fetch_add(1) + 1;
+  this->markOdometryUnhealthy(reason);
+  this->recovery_confirmation_count_.store(0);
+  if (!preserve_pending_correction) {
+    this->pending_correction_valid_ = false;
+    this->pending_correction_count_ = 0;
+  }
+  this->scheduleRecovery(rejected_count);
+  RCLCPP_ERROR_THROTTLE(
+    this->get_logger(), *this->get_clock(), 1000,
+    "Rejecting LiDAR scan at %.6f: %s (consecutive rejects: %llu)",
+    this->scan_stamp, reason.c_str(), static_cast<unsigned long long>(rejected_count));
+}
+
+void OdomNode::markOdometryUnhealthy(const std::string& reason) {
+  this->scan_healthy_.store(false);
+  this->recovery_scans_remaining_.store(this->covariance_recovery_scans_);
+  std::lock_guard<std::mutex> lock(this->health_mutex_);
+  this->health_reason_ = reason;
+}
+
+void OdomNode::markScanAccepted() {
+  const uint64_t rejected_count = this->consecutive_rejected_scans_.exchange(0);
+  this->last_accepted_scan_stamp_.store(this->scan_stamp);
+  this->last_accepted_steady_ns_.store(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  this->odom_ready_.store(true);
+  this->imu_healthy_.store(true);
+  this->scan_healthy_.store(true);
+  this->recovery_state_.store(RecoveryState::kTracking);
+  this->recovery_confirmation_count_.store(0);
+  this->updateAcceptedLidarMotion();
+  {
+    std::lock_guard<std::mutex> lock(this->health_mutex_);
+    this->health_reason_ = "scan-corrected odometry is healthy";
+  }
+  if (rejected_count > 0) {
+    RCLCPP_INFO(
+      this->get_logger(), "LiDAR odometry recovered after rejecting %llu scan(s)",
+      static_cast<unsigned long long>(rejected_count));
+  }
+}
+
+bool OdomNode::preprocessPoints() {
 
   // Deskew the original dlio-type scan
   if (this->deskew_) {
 
-    this->deskewPointcloud();
-
-    if (!this->first_valid_scan) {
-      return;
+    if (!this->deskewPointcloud()) {
+      return false;
     }
 
   } else {
 
     this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
 
+    if (!std::isfinite(this->scan_stamp)) {
+      this->rejectScan("non-finite LiDAR timestamp");
+      return false;
+    }
+
+    if (this->temporal_reanchor_pending_.exchange(false)) {
+      this->prev_scan_stamp = this->scan_stamp;
+      this->resetPredictionAnchorToTrustedPose(this->scan_stamp);
+      this->rejectScan("re-anchoring after an IMU timestamp discontinuity");
+      return false;
+    }
+
     // don't process scans until IMU data is present
     if (!this->first_valid_scan) {
 
+      std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
       if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
-        return;
+        return false;
       }
 
       this->first_valid_scan = true;
       this->T_prior = this->T; // assume no motion for the first scan
+      this->setPredictionAnchor(
+        this->T_prior, Eigen::Vector3f::Zero(), this->scan_stamp);
 
     } else {
 
       // IMU prior for second scan onwards
-    std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-      frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                                this->geo.prev_vel.cast<float>(), {this->scan_stamp});
-
-    if (frames.size() > 0) {
-      this->T_prior = frames.back();
-    } else {
-      this->T_prior = this->T;
-    }
+      const ImuIntegrationResult integration = this->integrateImu(
+        this->prediction_anchor_stamp_, this->prediction_anchor_orientation_,
+        this->prediction_anchor_position_, this->prediction_anchor_velocity_,
+        {this->scan_stamp});
+      if (!integration.ok()) {
+        const bool reanchor =
+          integration.status == ImuIntegrationStatus::kHistoryUnavailable ||
+          integration.status == ImuIntegrationStatus::kImuGap ||
+          integration.status == ImuIntegrationStatus::kIncomplete;
+        this->rejectScan(integration, reanchor);
+        return false;
+      }
+      this->T_prior = integration.frames.back();
+      this->setPredictionAnchor(
+        this->T_prior, integration.anchor_velocity, this->scan_stamp);
 
     }
 
@@ -645,13 +1238,16 @@ void OdomNode::preprocessPoints() {
     this->current_scan = this->deskewed_scan;
   }
 
+  return true;
+
 }
 
-void OdomNode::deskewPointcloud() {
+bool OdomNode::deskewPointcloud() {
   if (!this->original_scan || this->original_scan->points.empty()) {
     this->deskewed_scan.reset(new pcl::PointCloud<PointType>());
     this->deskew_status = false;
-    return;
+    this->rejectScan("empty LiDAR point cloud");
+    return false;
   }
   pcl::PointCloud<PointType>::Ptr deskewed_scan_ = std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan->points.size());
   // deskewed_scan_->points.resize(this->original_scan->points.size());
@@ -700,7 +1296,7 @@ void OdomNode::deskewPointcloud() {
                         boost::range::index_value<PointType&, long> p2)
       { return p1.value().timestamp != p2.value().timestamp; };
     extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt)
-      { return pt.value().timestamp * 1e-9f; };
+      { return pt.value().timestamp * 1e-9; };
   }
 
   // copy points into deskewed_scan_ in order of timestamp
@@ -732,45 +1328,64 @@ void OdomNode::deskewPointcloud() {
   int median_pt_index = timestamps.size() / 2;
   this->scan_stamp = timestamps[median_pt_index]; // set this->scan_stamp to the timestamp of the median point
 
+  if (!std::isfinite(this->scan_stamp) ||
+      !std::all_of(timestamps.begin(), timestamps.end(), [](double stamp) {
+        return std::isfinite(stamp);
+      })) {
+    this->deskew_status = false;
+    this->rejectScan("non-finite point timestamp in LiDAR scan");
+    return false;
+  }
+
+  if (this->temporal_reanchor_pending_.exchange(false)) {
+    this->prev_scan_stamp = this->scan_stamp;
+    this->resetPredictionAnchorToTrustedPose(this->scan_stamp);
+    this->deskew_status = false;
+    this->rejectScan("re-anchoring after an IMU timestamp discontinuity");
+    return false;
+  }
+
   // don't process scans until IMU data is present
   if (!this->first_valid_scan) {
+    std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
     if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
-      return;
+      return false;
     }
 
     this->first_valid_scan = true;
     this->T_prior = this->T; // assume no motion for the first scan
+    this->setPredictionAnchor(
+      this->T_prior, Eigen::Vector3f::Zero(), this->scan_stamp);
     pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = true;
-    return;
+    return true;
   }
 
   // IMU prior & deskewing for second scan onwards
-  std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-  frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                              this->geo.prev_vel.cast<float>(), timestamps);
-  this->deskew_size = frames.size(); // if integration successful, equal to timestamps.size()
-
-  // if there are no frames between the start and end of the sweep
-  // that probably means that there's a sync issue
-  if (frames.size() != timestamps.size()) {
-    RCLCPP_FATAL(this->get_logger(),"Bad time sync between LiDAR and IMU!");
-
-    this->T_prior = this->T;
-    pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
-    this->deskewed_scan = deskewed_scan_;
+  const ImuIntegrationResult integration = this->integrateImu(
+    this->prediction_anchor_stamp_, this->prediction_anchor_orientation_,
+    this->prediction_anchor_position_, this->prediction_anchor_velocity_, timestamps);
+  this->deskew_size = integration.frames.size();
+  if (!integration.ok()) {
+    const bool reanchor =
+      integration.status == ImuIntegrationStatus::kHistoryUnavailable ||
+      integration.status == ImuIntegrationStatus::kImuGap ||
+      integration.status == ImuIntegrationStatus::kIncomplete;
     this->deskew_status = false;
-    return;
+    this->rejectScan(integration, reanchor);
+    return false;
   }
 
   // update prior to be the estimated pose at the median time of the scan (corresponds to this->scan_stamp)
-  this->T_prior = frames[median_pt_index];
+  this->T_prior = integration.frames[median_pt_index];
+  this->setPredictionAnchor(
+    this->T_prior, integration.anchor_velocity, this->scan_stamp);
 
 #pragma omp parallel for num_threads(this->num_threads_)
   for (int i = 0; i < timestamps.size(); i++) {
 
-    Eigen::Matrix4f T = frames[i] * this->extrinsics.baselink2lidar_T;
+    Eigen::Matrix4f T = integration.frames[i] * this->extrinsics.baselink2lidar_T;
 
     // transform point to world frame
     for (int k = unique_time_indices[i]; k < unique_time_indices[i+1]; k++) {
@@ -782,6 +1397,7 @@ void OdomNode::deskewPointcloud() {
 
   this->deskewed_scan = deskewed_scan_;
   this->deskew_status = true;
+  return true;
 
 }
 
@@ -816,11 +1432,24 @@ void OdomNode::initializeDLIO() {
 
 void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc) {
 
-  std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
-  this->main_loop_running = true;
-  lock.unlock();
+  {
+    std::lock_guard<std::mutex> lock(this->main_loop_running_mutex);
+    this->main_loop_running = true;
+  }
+  ScopeExit finish_main_loop([this]() {
+    {
+      std::lock_guard<std::mutex> lock(this->main_loop_running_mutex);
+      this->main_loop_running = false;
+    }
+    this->submap_build_cv.notify_one();
+  });
 
   double then = this->now().seconds();
+
+  if (this->recovery_state_.load() == RecoveryState::kReseedPending &&
+      !this->submapReadyForRecovery()) {
+    return;
+  }
 
   if (this->first_scan_stamp == 0.) {
     this->first_scan_stamp = rclcpp::Time(pc->header.stamp).seconds();
@@ -835,15 +1464,17 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
   this->getScanFromROS(pc);
 
   // Preprocess points
-  this->preprocessPoints();
-
-  if (!this->first_valid_scan) {
+  if (!this->preprocessPoints()) {
     return;
   }
 
   if (this->current_scan->points.size() <= this->gicp_min_num_points_) {
-    RCLCPP_FATAL(this->get_logger(), "Low number of points in the cloud!");
+    this->rejectScan("too few points after LiDAR preprocessing");
     return;
+  }
+
+  if (this->recovery_state_.load() == RecoveryState::kReseedPending) {
+    this->reseedLocalMap();
   }
 
   // Compute Metrics
@@ -860,7 +1491,11 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
-    this->main_loop_running = false;
+    if (this->recovery_state_.load() != RecoveryState::kConfirming) {
+      this->markScanAccepted();
+      this->publishScanOdometry();
+    }
+    finish_main_loop.run();
     this->submap_future =
       std::async( std::launch::async, &OdomNode::buildKeyframesAndSubmap, this, this->state );
     this->submap_future.wait(); // wait until completion
@@ -868,21 +1503,24 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
   }
 
   // Get the next pose via IMU + S2M + GEO
-  this->getNextPose();
+  if (!this->getNextPose()) {
+    return;
+  }
+  if (this->recovery_state_.load() == RecoveryState::kConfirming &&
+      !this->recoveryRegistrationConfirmed()) {
+    this->prev_scan_stamp = this->scan_stamp;
+    return;
+  }
+  this->markScanAccepted();
 
   // Update current keyframe poses and map
   this->updateKeyframes();
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
-    this->main_loop_running = false;
+    finish_main_loop.run();
     this->submap_future =
       std::async( std::launch::async, &OdomNode::buildKeyframesAndSubmap, this, this->state );
-  } else {
-    lock.lock();
-    this->main_loop_running = false;
-    lock.unlock();
-    this->submap_build_cv.notify_one();
   }
 
   // Update trajectory
@@ -901,10 +1539,11 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
     published_cloud = this->deskewed_scan;
   }
   this->publishToROS(published_cloud, this->T_corr);
+  this->publishScanOdometry();
 
   // Update some statistics
   this->comp_times.push_back(this->now().seconds() - then);
-  this->gicp_hasConverged = this->gicp.hasConverged();
+  this->gicp_hasConverged = true;
 
   // Read this parameter on each scan so the dashboard can be toggled at runtime.
   this->get_parameter("debug/enable", this->debug_enabled_);
@@ -916,13 +1555,207 @@ void OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr
 
 }
 
+bool OdomNode::updateImuCalibration(
+    double stamp, const Eigen::Vector3f& ang_vel, const Eigen::Vector3f& lin_accel) {
+  this->imu_calibration_samples_.push_back({stamp, ang_vel, lin_accel});
+
+  if (this->imu_calibration_samples_.size() <
+        static_cast<size_t>(this->imu_calibration_min_samples_) ||
+      this->imu_calibration_samples_.back().stamp -
+        this->imu_calibration_samples_.front().stamp < this->imu_calib_time_) {
+    return false;
+  }
+
+  Eigen::Vector3f gyro_mean = Eigen::Vector3f::Zero();
+  Eigen::Vector3f accel_mean = Eigen::Vector3f::Zero();
+  double accel_norm_mean = 0.0;
+  for (const auto& sample : this->imu_calibration_samples_) {
+    gyro_mean += sample.ang_vel;
+    accel_mean += sample.lin_accel;
+    accel_norm_mean += sample.lin_accel.norm();
+  }
+  const double count = static_cast<double>(this->imu_calibration_samples_.size());
+  gyro_mean /= count;
+  accel_mean /= count;
+  accel_norm_mean /= count;
+
+  Eigen::Vector3f gyro_variance = Eigen::Vector3f::Zero();
+  double accel_norm_variance = 0.0;
+  for (const auto& sample : this->imu_calibration_samples_) {
+    const Eigen::Vector3f gyro_error = sample.ang_vel - gyro_mean;
+    gyro_variance += gyro_error.cwiseProduct(gyro_error);
+    const double accel_norm_error = sample.lin_accel.norm() - accel_norm_mean;
+    accel_norm_variance += accel_norm_error * accel_norm_error;
+  }
+  const Eigen::Vector3f gyro_stddev = (gyro_variance / count).cwiseSqrt();
+  const double accel_norm_stddev = std::sqrt(accel_norm_variance / count);
+
+  const bool stationary =
+    gyro_stddev.maxCoeff() <= this->imu_calibration_gyro_stddev_max_ &&
+    gyro_mean.norm() <= this->imu_calibration_gyro_mean_max_ &&
+    accel_norm_stddev <= this->imu_calibration_accel_norm_stddev_max_ &&
+    std::abs(accel_norm_mean - std::abs(this->gravity_)) <=
+      this->imu_calibration_accel_gravity_tolerance_;
+  if (!stationary) {
+    const ImuCalibrationSample current = this->imu_calibration_samples_.back();
+    this->imu_calibration_samples_.clear();
+    this->imu_calibration_samples_.push_back(current);
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "IMU calibration window was not stationary; restarting collection "
+      "(gyro std max %.6f rad/s, gyro mean norm %.6f rad/s, accel norm std %.6f m/s^2)",
+      gyro_stddev.maxCoeff(), gyro_mean.norm(), accel_norm_stddev);
+    return false;
+  }
+
+  Eigen::Vector3f grav_vec(0.0f, 0.0f, static_cast<float>(this->gravity_));
+  std::lock_guard<std::mutex> state_lock(this->geo.mtx);
+  if (this->gravity_align_) {
+    grav_vec = (accel_mean - this->state.b.accel).normalized() * std::abs(this->gravity_);
+    const Eigen::Quaternionf grav_q = Eigen::Quaternionf::FromTwoVectors(
+      grav_vec, Eigen::Vector3f(0.0f, 0.0f, static_cast<float>(this->gravity_)));
+    this->state.q = grav_q;
+    this->T.block(0, 0, 3, 3) = grav_q.toRotationMatrix();
+    this->lidarPose.q = grav_q;
+  }
+  if (this->calibrate_accel_) {
+    this->state.b.accel = accel_mean - grav_vec;
+  }
+  if (this->calibrate_gyro_) {
+    this->state.b.gyro = gyro_mean;
+  }
+  this->startup_gyro_bias_ = this->state.b.gyro;
+
+  RCLCPP_INFO(
+    this->get_logger(),
+    "Stationary IMU calibration complete with %zu samples; gyro bias "
+    "[%.8f, %.8f, %.8f] rad/s",
+    this->imu_calibration_samples_.size(), this->state.b.gyro.x(),
+    this->state.b.gyro.y(), this->state.b.gyro.z());
+  this->imu_calibration_samples_.clear();
+  this->imu_calibrated.store(true);
+  this->prev_imu_stamp = stamp;
+  return true;
+}
+
+void OdomNode::updateAcceptedLidarMotion() {
+  if (!this->accepted_lidar_pose_available_) {
+    this->previous_accepted_lidar_position_ = this->lidarPose.p;
+    this->previous_accepted_lidar_orientation_ = this->lidarPose.q;
+    this->previous_accepted_lidar_stamp_ = this->scan_stamp;
+    this->accepted_lidar_pose_available_ = true;
+    return;
+  }
+
+  const double dt = this->scan_stamp - this->previous_accepted_lidar_stamp_;
+  if (std::isfinite(dt) && dt > 0.0) {
+    const double linear_speed =
+      (this->lidarPose.p - this->previous_accepted_lidar_position_).norm() / dt;
+    Eigen::Quaternionf delta =
+      this->previous_accepted_lidar_orientation_.conjugate() * this->lidarPose.q;
+    delta.normalize();
+    const double angular_distance = 2.0 * std::acos(std::clamp(
+      std::abs(static_cast<double>(delta.w())), 0.0, 1.0));
+    this->accepted_lidar_linear_speed_.store(linear_speed);
+    this->accepted_lidar_angular_speed_.store(angular_distance / dt);
+  }
+  this->previous_accepted_lidar_position_ = this->lidarPose.p;
+  this->previous_accepted_lidar_orientation_ = this->lidarPose.q;
+  this->previous_accepted_lidar_stamp_ = this->scan_stamp;
+}
+
+void OdomNode::updateOnlineGyroBias(
+    double stamp, double dt, const Eigen::Vector3f& ang_vel,
+    const Eigen::Vector3f& lin_accel) {
+  if (!this->online_gyro_bias_enabled_ || !this->odometryOutputHealthy() ||
+      this->accepted_lidar_linear_speed_.load() >
+        this->online_gyro_bias_lidar_linear_max_ ||
+      this->accepted_lidar_angular_speed_.load() >
+        this->online_gyro_bias_lidar_angular_max_deg_ * M_PI / 180.0) {
+    this->online_bias_samples_.clear();
+    return;
+  }
+
+  this->online_bias_samples_.push_back({stamp, ang_vel, lin_accel});
+  while (this->online_bias_samples_.size() > 1 &&
+      stamp - this->online_bias_samples_[1].stamp >=
+        this->online_gyro_bias_stationary_time_) {
+    this->online_bias_samples_.pop_front();
+  }
+  if (this->online_bias_samples_.size() < 2 ||
+      this->online_bias_samples_.back().stamp -
+        this->online_bias_samples_.front().stamp <
+          this->online_gyro_bias_stationary_time_) {
+    return;
+  }
+
+  Eigen::Vector3f gyro_mean = Eigen::Vector3f::Zero();
+  double accel_norm_mean = 0.0;
+  for (const auto& sample : this->online_bias_samples_) {
+    gyro_mean += sample.ang_vel;
+    accel_norm_mean += sample.lin_accel.norm();
+  }
+  const double count = static_cast<double>(this->online_bias_samples_.size());
+  gyro_mean /= count;
+  accel_norm_mean /= count;
+
+  Eigen::Vector3f gyro_variance = Eigen::Vector3f::Zero();
+  double accel_norm_variance = 0.0;
+  for (const auto& sample : this->online_bias_samples_) {
+    const Eigen::Vector3f gyro_error = sample.ang_vel - gyro_mean;
+    gyro_variance += gyro_error.cwiseProduct(gyro_error);
+    const double accel_error = sample.lin_accel.norm() - accel_norm_mean;
+    accel_norm_variance += accel_error * accel_error;
+  }
+  const Eigen::Vector3f gyro_stddev = (gyro_variance / count).cwiseSqrt();
+  const double accel_norm_stddev = std::sqrt(accel_norm_variance / count);
+  if (gyro_stddev.maxCoeff() > this->imu_calibration_gyro_stddev_max_ ||
+      accel_norm_stddev > this->imu_calibration_accel_norm_stddev_max_) {
+    return;
+  }
+
+  const Eigen::Vector3f min_bias = this->startup_gyro_bias_.array() -
+    this->online_gyro_bias_max_delta_;
+  const Eigen::Vector3f max_bias = this->startup_gyro_bias_.array() +
+    this->online_gyro_bias_max_delta_;
+  const Eigen::Vector3f target = gyro_mean.cwiseMax(min_bias).cwiseMin(max_bias);
+  const double alpha = std::clamp(
+    1.0 - std::exp(-dt / this->online_gyro_bias_time_constant_), 0.0, 1.0);
+  std::lock_guard<std::mutex> state_lock(this->geo.mtx);
+  this->state.b.gyro =
+    ((1.0 - alpha) * this->state.b.gyro + alpha * target).eval();
+}
+
 void OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
 
+  const double imu_stamp_secs = rclcpp::Time(imu_raw->header.stamp).seconds();
+  if (!std::isfinite(imu_stamp_secs)) {
+    this->imu_healthy_.store(false);
+    this->markOdometryUnhealthy("non-finite IMU timestamp");
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Dropping IMU measurement with a non-finite timestamp");
+    return;
+  }
+
+  double dt = 1.0 / 200.0;
+  if (this->last_received_imu_stamp_ > 0.0) {
+    dt = imu_stamp_secs - this->last_received_imu_stamp_;
+    if (!std::isfinite(dt) || dt <= 0.0) {
+      this->imu_healthy_.store(false);
+      this->markOdometryUnhealthy("non-monotonic IMU timestamp");
+      RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Dropping non-monotonic IMU timestamp %.6f after %.6f (dt=%.9f)",
+        imu_stamp_secs, this->last_received_imu_stamp_, dt);
+      return;
+    }
+  }
+  this->last_received_imu_stamp_ = imu_stamp_secs;
   this->first_imu_received = true;
 
-  sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
-  this->imu_stamp = imu->header.stamp;
-  double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
+  sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu(imu_raw, dt);
+  this->latest_imu_stamp_ns_.store(rclcpp::Time(imu->header.stamp).nanoseconds());
 
   Eigen::Vector3f lin_accel;
   Eigen::Vector3f ang_vel;
@@ -936,133 +1769,213 @@ void OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
   lin_accel[1] = imu->linear_acceleration.y;
   lin_accel[2] = imu->linear_acceleration.z;
 
-  if (this->first_imu_stamp == 0.) {
-    this->first_imu_stamp = imu_stamp_secs;
+  if (!this->imu_calibrated.load()) {
+    this->updateImuCalibration(imu_stamp_secs, ang_vel, lin_accel);
+    return;
   }
 
-  // IMU calibration procedure - do for three seconds
-  if (!this->imu_calibrated) {
+  if (this->prev_imu_stamp > 0.0) {
+    dt = imu_stamp_secs - this->prev_imu_stamp;
+  }
+  if (!std::isfinite(dt) || dt <= 0.0) {
+    this->imu_healthy_.store(false);
+    this->markOdometryUnhealthy("invalid calibrated IMU interval");
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Dropping invalid calibrated IMU interval %.9f seconds", dt);
+    this->prev_imu_stamp = imu_stamp_secs;
+    return;
+  }
+  this->imu_rates.push_back(1.0 / dt);
 
-    static int num_samples = 0;
-    static Eigen::Vector3f gyro_avg (0., 0., 0.);
-    static Eigen::Vector3f accel_avg (0., 0., 0.);
-    static bool print = true;
+  // Store transformed raw measurements. Biases are applied when propagating or
+  // to one copied deskew interval, so every interval uses a consistent snapshot.
+  this->imu_meas.stamp = imu_stamp_secs;
+  this->imu_meas.dt = dt;
+  this->imu_meas.lin_accel = this->imu_accel_sm_ * lin_accel;
+  this->imu_meas.ang_vel = ang_vel;
+  this->prev_imu_stamp = this->imu_meas.stamp;
 
-    if ((imu_stamp_secs - this->first_imu_stamp) < this->imu_calib_time_) {
-
-      num_samples++;
-
-      gyro_avg[0] += ang_vel[0];
-      gyro_avg[1] += ang_vel[1];
-      gyro_avg[2] += ang_vel[2];
-
-      accel_avg[0] += lin_accel[0];
-      accel_avg[1] += lin_accel[1];
-      accel_avg[2] += lin_accel[2];
-
-      if(print) {
-        std::cout << std::endl << " Calibrating IMU for " << this->imu_calib_time_ << " seconds... ";
-        std::cout.flush();
-        print = false;
-      }
-
-    } else {
-
-      std::cout << "done" << std::endl << std::endl;
-
-      gyro_avg /= num_samples;
-      accel_avg /= num_samples;
-
-      Eigen::Vector3f grav_vec (0., 0., this->gravity_);
-
-      if (this->gravity_align_) {
-
-        // Estimate gravity vector - Only approximate if biases have not been pre-calibrated
-        grav_vec = (accel_avg - this->state.b.accel).normalized() * abs(this->gravity_);
-        Eigen::Quaternionf grav_q = Eigen::Quaternionf::FromTwoVectors(grav_vec, Eigen::Vector3f(0., 0., this->gravity_));
-
-        // set gravity aligned orientation
-        this->state.q = grav_q;
-        this->T.block(0,0,3,3) = this->state.q.toRotationMatrix();
-        this->lidarPose.q = this->state.q;
-
-        // rpy
-        auto euler = grav_q.toRotationMatrix().eulerAngles(2, 1, 0);
-        double yaw = euler[0] * (180.0/M_PI);
-        double pitch = euler[1] * (180.0/M_PI);
-        double roll = euler[2] * (180.0/M_PI);
-
-        // use alternate representation if the yaw is smaller
-        if (abs(remainder(yaw + 180.0, 360.0)) < abs(yaw)) {
-          yaw   = remainder(yaw + 180.0,   360.0);
-          pitch = remainder(180.0 - pitch, 360.0);
-          roll  = remainder(roll + 180.0,  360.0);
-        }
-        std::cout << " Estimated initial attitude:" << std::endl;
-        std::cout << "   Roll  [deg]: " << to_string_with_precision(roll, 4) << std::endl;
-        std::cout << "   Pitch [deg]: " << to_string_with_precision(pitch, 4) << std::endl;
-        std::cout << "   Yaw   [deg]: " << to_string_with_precision(yaw, 4) << std::endl;
-        std::cout << std::endl;
-      }
-
-      if (this->calibrate_accel_) {
-
-        // subtract gravity from avg accel to get bias
-        this->state.b.accel = accel_avg - grav_vec;
-
-        std::cout << " Accel biases [xyz]: " << to_string_with_precision(this->state.b.accel[0], 8) << ", "
-                                             << to_string_with_precision(this->state.b.accel[1], 8) << ", "
-                                             << to_string_with_precision(this->state.b.accel[2], 8) << std::endl;
-      }
-
-      if (this->calibrate_gyro_) {
-
-        this->state.b.gyro = gyro_avg;
-
-        std::cout << " Gyro biases  [xyz]: " << to_string_with_precision(this->state.b.gyro[0], 8) << ", "
-                                             << to_string_with_precision(this->state.b.gyro[1], 8) << ", "
-                                             << to_string_with_precision(this->state.b.gyro[2], 8) << std::endl;
-      }
-
-      this->imu_calibrated = true;
-      this->prev_imu_stamp = imu_stamp_secs;
+  if (dt > this->imu_max_gap_seconds_) {
+    {
+      std::lock_guard<std::mutex> lock(this->mtx_imu);
+      this->imu_buffer.clear();
+      this->imu_buffer.push_front(this->imu_meas);
     }
-
-  } else {
-
-    double dt = imu_stamp_secs - this->prev_imu_stamp;
-    if (dt == 0) { dt = 1.0/200.0; }
-    this->imu_rates.push_back( 1./dt );
-
-    // Apply the calibrated bias to the new IMU measurements
-    this->imu_meas.stamp = imu_stamp_secs;
-    this->imu_meas.dt = dt;
-    this->prev_imu_stamp = this->imu_meas.stamp;
-
-    Eigen::Vector3f lin_accel_corrected = (this->imu_accel_sm_ * lin_accel) - this->state.b.accel;
-    Eigen::Vector3f ang_vel_corrected = ang_vel - this->state.b.gyro;
-
-    this->imu_meas.lin_accel = lin_accel_corrected;
-    this->imu_meas.ang_vel = ang_vel_corrected;
-
-    // Store calibrated IMU measurements into imu buffer for manual integration later.
-    this->mtx_imu.lock();
-    this->imu_buffer.push_front(this->imu_meas);
-    this->mtx_imu.unlock();
-
-    // Notify the callbackPointCloud thread that IMU data exists for this time
+    this->imu_healthy_.store(false);
+    this->markOdometryUnhealthy("IMU timestamp gap; waiting for LiDAR re-anchor");
+    this->temporal_reanchor_pending_.store(true);
+    this->online_bias_samples_.clear();
     this->cv_imu_stamp.notify_one();
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "IMU gap of %.6f seconds exceeds %.6f seconds; holding state and re-anchoring LiDAR",
+      dt, this->imu_max_gap_seconds_);
+    return;
+  }
 
-    if (this->geo.first_opt_done) {
-      // Geometric Observer: Propagate State
-      this->propagateState();
-    }
+  this->updateOnlineGyroBias(
+    imu_stamp_secs, dt, this->imu_meas.ang_vel, this->imu_meas.lin_accel);
 
+  {
+    std::lock_guard<std::mutex> lock(this->mtx_imu);
+    this->imu_buffer.push_front(this->imu_meas);
+  }
+  this->cv_imu_stamp.notify_one();
+
+  if (this->geo.first_opt_done) {
+    this->propagateState();
   }
 
 }
 
-void OdomNode::getNextPose() {
+bool OdomNode::validateRegistrationQuality(std::string& reason) {
+  const double source_points = static_cast<double>(this->current_scan->size());
+  const double correspondence_ratio = source_points > 0.0 ?
+    static_cast<double>(this->gicp.num_correspondences) / source_points : 0.0;
+  const double normalized_error = this->gicp.num_correspondences > 0 ?
+    this->gicp.getFinalError() /
+      static_cast<double>(this->gicp.num_correspondences) :
+    std::numeric_limits<double>::infinity();
+
+  const Eigen::Matrix<double, 6, 6> hessian = this->gicp.getFinalHessian();
+  Eigen::JacobiSVD<Eigen::Matrix<double, 6, 6>> svd(
+    hessian, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const auto singular_values = svd.singularValues().cwiseAbs();
+  const double minimum_singular = singular_values.minCoeff();
+  const double maximum_singular = singular_values.maxCoeff();
+  const double hessian_condition = minimum_singular > 1.0e-12 ?
+    maximum_singular / minimum_singular : std::numeric_limits<double>::infinity();
+
+  this->last_correspondence_ratio_.store(correspondence_ratio);
+  this->last_normalized_registration_error_.store(normalized_error);
+  this->last_hessian_condition_.store(hessian_condition);
+
+  if (!std::isfinite(correspondence_ratio) ||
+      correspondence_ratio < this->gicp_min_correspondence_ratio_) {
+    std::ostringstream stream;
+    stream << "GICP correspondence ratio " << correspondence_ratio << " is below "
+           << this->gicp_min_correspondence_ratio_;
+    reason = stream.str();
+    return false;
+  }
+  if (!std::isfinite(normalized_error) || normalized_error < 0.0) {
+    reason = "GICP returned a non-finite normalized error";
+    return false;
+  }
+  if (!std::isfinite(hessian_condition) ||
+      hessian_condition > this->gicp_max_hessian_condition_) {
+    std::ostringstream stream;
+    stream << "GICP Hessian condition " << hessian_condition << " exceeds "
+           << this->gicp_max_hessian_condition_;
+    reason = stream.str();
+    return false;
+  }
+
+  const auto median = [](const std::deque<double>& values) {
+      std::vector<double> sorted(values.begin(), values.end());
+      const size_t middle = sorted.size() / 2;
+      std::nth_element(sorted.begin(), sorted.begin() + middle, sorted.end());
+      double result = sorted[middle];
+      if (sorted.size() % 2 == 0) {
+        const auto lower = std::max_element(sorted.begin(), sorted.begin() + middle);
+        result = 0.5 * (result + *lower);
+      }
+      return result;
+    };
+
+  if (this->registration_error_history_.size() >=
+      static_cast<size_t>(this->gicp_quality_warmup_scans_)) {
+    const double error_limit =
+      median(this->registration_error_history_) *
+      this->gicp_max_normalized_error_factor_;
+    if (normalized_error > error_limit) {
+      std::ostringstream stream;
+      stream << "GICP normalized error " << normalized_error
+             << " exceeds adaptive limit " << error_limit;
+      reason = stream.str();
+      return false;
+    }
+
+    const double condition_limit = std::min(
+      this->gicp_max_hessian_condition_,
+      median(this->registration_condition_history_) *
+        this->gicp_max_hessian_condition_factor_);
+    if (hessian_condition > condition_limit) {
+      std::ostringstream stream;
+      stream << "GICP Hessian condition " << hessian_condition
+             << " exceeds adaptive limit " << condition_limit;
+      reason = stream.str();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool OdomNode::correctionNeedsConfirmation(
+    const Eigen::Matrix4f& correction, double correction_distance,
+    double correction_rotation_deg, std::string& reason) {
+  if (this->gicp_correction_confirmation_scans_ <= 1 ||
+      (correction_distance <= this->gicp_soft_correction_distance_ &&
+       correction_rotation_deg <= this->gicp_soft_correction_rotation_deg_)) {
+    this->pending_correction_valid_ = false;
+    this->pending_correction_count_ = 0;
+    return false;
+  }
+
+  if (!this->pending_correction_valid_) {
+    this->pending_correction_ = correction;
+    this->pending_correction_count_ = 1;
+    this->pending_correction_valid_ = true;
+  } else {
+    const Eigen::Matrix4f delta = correction * this->pending_correction_.inverse();
+    const double distance = delta.block<3, 1>(0, 3).norm();
+    Eigen::Quaternionf rotation(delta.block<3, 3>(0, 0));
+    rotation.normalize();
+    const double rotation_deg =
+      Eigen::AngleAxisf(rotation).angle() * 180.0 / M_PI;
+    if (std::isfinite(distance) && std::isfinite(rotation_deg) &&
+        distance <= this->gicp_correction_consistency_distance_ &&
+        rotation_deg <= this->gicp_correction_consistency_rotation_deg_) {
+      ++this->pending_correction_count_;
+    } else {
+      this->pending_correction_ = correction;
+      this->pending_correction_count_ = 1;
+    }
+  }
+
+  if (this->pending_correction_count_ >=
+      this->gicp_correction_confirmation_scans_) {
+    this->pending_correction_valid_ = false;
+    this->pending_correction_count_ = 0;
+    return false;
+  }
+
+  std::ostringstream stream;
+  stream << "GICP correction pending confirmation (" << correction_distance
+         << " m, " << correction_rotation_deg << " deg, candidate "
+         << this->pending_correction_count_ << "/"
+         << this->gicp_correction_confirmation_scans_ << ")";
+  reason = stream.str();
+  return true;
+}
+
+void OdomNode::recordAcceptedRegistrationQuality() {
+  this->registration_error_history_.push_back(
+    this->last_normalized_registration_error_.load());
+  this->registration_condition_history_.push_back(
+    this->last_hessian_condition_.load());
+  while (this->registration_error_history_.size() >
+      static_cast<size_t>(this->gicp_quality_history_size_)) {
+    this->registration_error_history_.pop_front();
+  }
+  while (this->registration_condition_history_.size() >
+      static_cast<size_t>(this->gicp_quality_history_size_)) {
+    this->registration_condition_history_.pop_front();
+  }
+}
+
+bool OdomNode::getNextPose() {
 
   // Check if the new submap is ready to be used
   this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
@@ -1085,9 +1998,67 @@ void OdomNode::getNextPose() {
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
-  // Get final transformation in global frame
-  this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
+  this->gicp_hasConverged = this->gicp.hasConverged();
+  if (!this->gicp_hasConverged.load()) {
+    this->pending_correction_valid_ = false;
+    this->rejectScan("GICP did not converge");
+    return false;
+  }
+
+  std::string quality_reason;
+  if (!this->validateRegistrationQuality(quality_reason)) {
+    this->pending_correction_valid_ = false;
+    this->pending_correction_count_ = 0;
+    this->rejectScan(quality_reason);
+    return false;
+  }
+
+  // Both clouds are already in the global frame, so this matrix is the correction
+  // applied to the IMU prior and should remain close to identity.
+  const Eigen::Matrix4f correction = this->gicp.getFinalTransformation();
+  if (!correction.allFinite()) {
+    this->rejectScan("GICP returned a non-finite correction");
+    return false;
+  }
+
+  const Eigen::Matrix3f correction_rotation = correction.block<3, 3>(0, 0);
+  const float rotation_determinant = correction_rotation.determinant();
+  Eigen::Quaternionf correction_quaternion(correction_rotation);
+  if (!std::isfinite(rotation_determinant) || std::abs(rotation_determinant - 1.0f) > 0.1f ||
+      !correction_quaternion.coeffs().allFinite() || correction_quaternion.norm() < 1e-6f) {
+    this->rejectScan("GICP returned an invalid rotation");
+    return false;
+  }
+  correction_quaternion.normalize();
+
+  const double correction_distance = correction.block<3, 1>(0, 3).norm();
+  const double correction_rotation_deg =
+    Eigen::AngleAxisf(correction_quaternion).angle() * 180.0 / M_PI;
+  if (!std::isfinite(correction_distance) || !std::isfinite(correction_rotation_deg) ||
+      correction_distance > this->gicp_max_correction_distance_ ||
+      correction_rotation_deg > this->gicp_max_correction_rotation_deg_) {
+    std::ostringstream reason;
+    reason << "GICP correction exceeds safety bounds (" << correction_distance << " m, "
+           << correction_rotation_deg << " deg)";
+    this->rejectScan(reason.str());
+    return false;
+  }
+
+  std::string confirmation_reason;
+  if (this->correctionNeedsConfirmation(
+      correction, correction_distance, correction_rotation_deg,
+      confirmation_reason)) {
+    this->rejectScan(confirmation_reason, true);
+    return false;
+  }
+
+  // Commit the correction only after all validation has passed.
+  this->T_corr = correction;
   this->T = this->T_corr * this->T_prior;
+  if (!this->T.allFinite()) {
+    this->rejectScan("corrected pose is non-finite");
+    return false;
+  }
 
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
@@ -1095,34 +2066,40 @@ void OdomNode::getNextPose() {
 
   // Geometric observer update
   this->updateState();
+  this->recordAcceptedRegistrationQuality();
 
+  Eigen::Vector3f corrected_velocity;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    corrected_velocity = this->state.v.lin.w;
+  }
+  this->setPredictionAnchor(this->T, corrected_velocity, this->scan_stamp);
+
+  return true;
 }
 
-bool OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
-                                          boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-                                          boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
-
-  if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    // Wait for the latest IMU data
-    std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
-    this->cv_imu_stamp.wait(lock, [this, &end_time]{ return this->imu_buffer.front().stamp >= end_time; });
+bool OdomNode::imuMeasFromTimeRange(
+    boost::circular_buffer<ImuMeas>& imu_snapshot, double start_time, double end_time,
+    boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
+    boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
+  if (imu_snapshot.size() < 2) {
+    return false;
   }
 
-  auto imu_it = this->imu_buffer.begin();
+  auto imu_it = imu_snapshot.begin();
 
   auto last_imu_it = imu_it;
   imu_it++;
-  while (imu_it != this->imu_buffer.end() && imu_it->stamp >= end_time) {
+  while (imu_it != imu_snapshot.end() && imu_it->stamp >= end_time) {
     last_imu_it = imu_it;
     imu_it++;
   }
 
-  while (imu_it != this->imu_buffer.end() && imu_it->stamp >= start_time) {
+  while (imu_it != imu_snapshot.end() && imu_it->stamp >= start_time) {
     imu_it++;
   }
 
-  if (imu_it == this->imu_buffer.end()) {
-    // not enough IMU measurements, return false
+  if (imu_it == imu_snapshot.end()) {
     return false;
   }
   imu_it++;
@@ -1134,22 +2111,85 @@ bool OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
   return true;
 }
 
-std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+OdomNode::ImuIntegrationResult
 OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init,
                              Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps) {
 
-  const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
+  ImuIntegrationResult result;
 
-  if (sorted_timestamps.empty() || start_time > sorted_timestamps.front()) {
-    // invalid input, return empty vector
-    return empty;
+  if (!std::isfinite(start_time) || sorted_timestamps.empty() ||
+      !std::is_sorted(sorted_timestamps.begin(), sorted_timestamps.end()) ||
+      start_time > sorted_timestamps.front() ||
+      !std::all_of(sorted_timestamps.begin(), sorted_timestamps.end(), [](double stamp) {
+        return std::isfinite(stamp);
+      })) {
+    result.status = ImuIntegrationStatus::kInvalidRange;
+    result.reason = "invalid or unsorted integration timestamps";
+    return result;
+  }
+
+  boost::circular_buffer<ImuMeas> imu_snapshot;
+  {
+    std::unique_lock<std::mutex> lock(this->mtx_imu);
+    const double end_time = sorted_timestamps.back();
+    const bool imu_arrived = this->cv_imu_stamp.wait_for(
+      lock, std::chrono::duration<double>(this->imu_wait_timeout_seconds_),
+      [this, end_time]() {
+        return !this->imu_buffer.empty() && this->imu_buffer.front().stamp >= end_time;
+      });
+    if (!imu_arrived) {
+      result.status = ImuIntegrationStatus::kImuTimeout;
+      result.reason = "timed out waiting for IMU data through the end of the LiDAR scan";
+      if (!this->imu_buffer.empty()) {
+        result.oldest_imu_stamp = this->imu_buffer.back().stamp;
+        result.newest_imu_stamp = this->imu_buffer.front().stamp;
+      }
+      return result;
+    }
+
+    result.oldest_imu_stamp = this->imu_buffer.back().stamp;
+    result.newest_imu_stamp = this->imu_buffer.front().stamp;
+    if (this->imu_buffer.size() < 2 || result.oldest_imu_stamp >= start_time) {
+      result.status = ImuIntegrationStatus::kHistoryUnavailable;
+      result.reason = "IMU buffer does not contain a sample before the integration start";
+      return result;
+    }
+    imu_snapshot = this->imu_buffer;
+  }
+
+  Eigen::Vector3f gyro_bias;
+  Eigen::Vector3f accel_bias;
+  {
+    std::lock_guard<std::mutex> state_lock(this->geo.mtx);
+    gyro_bias = this->state.b.gyro;
+    accel_bias = this->state.b.accel;
+  }
+  for (auto& measurement : imu_snapshot) {
+    measurement.ang_vel -= gyro_bias;
+    measurement.lin_accel -= accel_bias;
   }
 
   boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it;
   boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it;
-  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), begin_imu_it, end_imu_it) == false) {
-    // not enough IMU measurements, return empty vector
-    return empty;
+  if (!this->imuMeasFromTimeRange(
+        imu_snapshot, start_time, sorted_timestamps.back(), begin_imu_it, end_imu_it) ||
+      begin_imu_it == end_imu_it || begin_imu_it + 1 == end_imu_it) {
+    result.status = ImuIntegrationStatus::kHistoryUnavailable;
+    result.reason = "unable to bracket the LiDAR scan with IMU measurements";
+    return result;
+  }
+
+  for (auto previous = begin_imu_it, current = begin_imu_it + 1;
+       current != end_imu_it; ++previous, ++current) {
+    const double dt = current->stamp - previous->stamp;
+    if (!std::isfinite(previous->stamp) || !std::isfinite(current->stamp) ||
+        !std::isfinite(dt) || dt <= 0.0 || dt > this->imu_max_gap_seconds_) {
+      std::ostringstream reason;
+      reason << "invalid IMU interval of " << dt << " seconds";
+      result.status = ImuIntegrationStatus::kImuGap;
+      result.reason = reason.str();
+      return result;
+    }
   }
 
   // Backwards integration to find pose at first IMU sample
@@ -1157,7 +2197,7 @@ OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vect
   const ImuMeas& f2 = *(begin_imu_it+1);
 
   // Time between first two IMU samples
-  double dt = f2.dt;
+  double dt = f2.stamp - f1.stamp;
 
   // Time between first IMU sample and start_time
   double idt = start_time - f1.stamp;
@@ -1207,14 +2247,33 @@ OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vect
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+  result.anchor_velocity.setConstant(std::numeric_limits<float>::quiet_NaN());
+  result.frames = this->integrateImuInternal(
+    q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it,
+    sorted_timestamps.size() / 2, result.anchor_velocity);
+  if (result.frames.size() != sorted_timestamps.size() ||
+      !result.anchor_velocity.allFinite() ||
+      !std::all_of(result.frames.begin(), result.frames.end(), [](const Eigen::Matrix4f& frame) {
+        return frame.allFinite();
+      })) {
+    result.frames.clear();
+    result.status = ImuIntegrationStatus::kIncomplete;
+    result.reason = "IMU integration did not produce a finite pose for every point timestamp";
+    return result;
+  }
+
+  result.status = ImuIntegrationStatus::kSuccess;
+  result.reason = "success";
+  return result;
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
                                      boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                                     std::size_t anchor_index,
+                                     Eigen::Vector3f& anchor_velocity) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -1230,6 +2289,7 @@ OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init
   auto imu_it = prev_imu_it + 1;
 
   auto stamp_it = sorted_timestamps.begin();
+  std::size_t timestamp_index = 0;
 
   for (; imu_it != end_imu_it; imu_it++) {
 
@@ -1237,7 +2297,7 @@ OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init
     const ImuMeas& f = *imu_it;
 
     // Time between IMU samples
-    double dt = f.dt;
+    double dt = f.stamp - f0.stamp;
 
     // Angular acceleration
     Eigen::Vector3f alpha_dt = f.ang_vel - f0.ang_vel;
@@ -1283,6 +2343,7 @@ OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init
 
       // Position
       Eigen::Vector3f p_i = p + v*idt + 0.5*a0*idt*idt + (1/6.)*j*idt*idt*idt;
+      Eigen::Vector3f v_i = v + a0*idt + 0.5*j*idt*idt;
 
       // Transformation
       Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
@@ -1291,7 +2352,12 @@ OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init
 
       imu_se3.push_back(T);
 
+      if (timestamp_index == anchor_index) {
+        anchor_velocity = v_i;
+      }
+
       stamp_it++;
+      ++timestamp_index;
     }
 
     // Position
@@ -1332,12 +2398,16 @@ void OdomNode::propagateState() {
   std::lock_guard<std::mutex> lock( this->geo.mtx );
 
   double dt = this->imu_meas.dt;
+  const Eigen::Vector3f corrected_lin_accel =
+    this->imu_meas.lin_accel - this->state.b.accel;
+  const Eigen::Vector3f corrected_ang_vel =
+    this->imu_meas.ang_vel - this->state.b.gyro;
 
   Eigen::Quaternionf qhat = this->state.q, omega;
   Eigen::Vector3f world_accel;
 
   // Transform accel from body to world frame
-  world_accel = qhat._transformVector(this->imu_meas.lin_accel);
+  world_accel = qhat._transformVector(corrected_lin_accel);
 
   // Accel propogation
   this->state.p[0] += this->state.v.lin.w[0]*dt + 0.5*dt*dt*world_accel[0];
@@ -1351,7 +2421,7 @@ void OdomNode::propagateState() {
 
   // Gyro propogation
   omega.w() = 0;
-  omega.vec() = this->imu_meas.ang_vel;
+  omega.vec() = corrected_ang_vel;
   Eigen::Quaternionf tmp = qhat * omega;
   this->state.q.w() += 0.5 * dt * tmp.w();
   this->state.q.vec() += 0.5 * dt * tmp.vec();
@@ -1359,7 +2429,7 @@ void OdomNode::propagateState() {
   // Ensure quaternion is properly normalized
   this->state.q.normalize();
 
-  this->state.v.ang.b = this->imu_meas.ang_vel;
+  this->state.v.ang.b = corrected_ang_vel;
   this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
 
 }
@@ -1424,19 +2494,13 @@ void OdomNode::updateState() {
 
 }
 
-sensor_msgs::msg::Imu::SharedPtr OdomNode::transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu_raw) {
+sensor_msgs::msg::Imu::SharedPtr OdomNode::transformImu(
+    const sensor_msgs::msg::Imu::SharedPtr& imu_raw, double dt) {
 
   auto imu = std::make_shared<sensor_msgs::msg::Imu>();
 
   // Copy header
   imu->header = imu_raw->header;
-
-  double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
-  static double prev_stamp = imu_stamp_secs;
-  double dt = imu_stamp_secs - prev_stamp;
-  prev_stamp = imu_stamp_secs;
-  
-  if (dt == 0) { dt = 1.0/200.0; }
 
   // Transform angular velocity (will be the same on a rigid body, so just rotate to ROS convention)
   Eigen::Vector3f ang_vel(imu_raw->angular_velocity.x,

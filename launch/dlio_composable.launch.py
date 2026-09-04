@@ -73,6 +73,7 @@ def generate_launch_description():
             ('pointcloud', pointcloud_topic),
             ('imu', imu_topic),
             ('odom', 'dlio/odom_node/odom'),
+            ('odom_scan', 'dlio/odom_node/odom_scan'),
             ('pose', 'dlio/odom_node/pose'),
             ('path', 'dlio/odom_node/path'),
             ('kf_pose', 'dlio/odom_node/keyframes'),
